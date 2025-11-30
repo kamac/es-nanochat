@@ -41,14 +41,16 @@ max_seq_len = 2048 # max context length
 num_iterations = -1 # explicit number of steps of the optimization (-1 = disable)
 target_flops = -1.0 # calculate num_iterations to reach target_flops. Useful for scaling laws experiments (-1 = disable)
 target_param_data_ratio = 20 # calculate num_iterations to maintain fixed data:param ratio (Chinchilla=20) (-1 = disable)
-# Optimization
-device_batch_size = 32 # per-device batch size (set to not OOM)
-total_batch_size = 524288 # total desired batch size, in #tokens
-embedding_lr = 0.2 # learning rate for the embedding parameters (Adam)
-unembedding_lr = 0.004 # learning rate for the unembedding parameters (Adam)
-weight_decay = 0.0 # weight decay for the embedding/unembedding parameters (Adam)
-matrix_lr = 0.02 # learning rate for the matrix parameters (Muon)
-grad_clip = 1.0 # gradient clipping value (0.0 = disabled)
+# Optimization (EGGROLL - Evolution Strategies)
+device_batch_size = 32 # sequences per forward pass (set to not OOM)
+# ES hyperparameters
+population_size = 256 # ES population size per update (start small, scale up; paper uses 262144)
+sigma = 1.0 # ES noise temperature (controls perturbation magnitude in forward pass)
+es_lr = 0.02 # ES effective learning rate (tuned step size, independent of sigma)
+es_rank = 1 # Low-rank perturbation rank (r in paper, typically 1)
+weight_decay = 0.0 # weight decay (applied as decoupled weight decay like AdamW)
+base_seed = 42 # base random seed for deterministic noise generation
+chunk_size = 8 # ES population chunk size (memory vs speed tradeoff; start conservative)
 warmup_ratio = 0.0 # ratio of iterations for LR warmup
 warmdown_ratio = 0.2 # ratio of iterations for LR warmdown
 final_lr_frac = 0.0 # final LR is this fraction of the initial LR
@@ -96,15 +98,13 @@ print0(f"model_dim: {model_dim}")
 print0(f"num_heads: {num_heads}")
 print0(f"num_kv_heads: {num_kv_heads}")
 
-# Optimizer / data / training length related hyperparameters
-# figure out the needed gradient accumulation to reach the desired total batch size
-tokens_per_fwdbwd = device_batch_size * max_seq_len # tokens per iteration for a single rank
-world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size # total tokens per iteration for all ranks
-assert total_batch_size % world_tokens_per_fwdbwd == 0
-grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
-print0(f"Tokens / micro-batch / rank: {device_batch_size} x {max_seq_len} = {tokens_per_fwdbwd:,}")
-print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
-print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
+# ES training hyperparameters
+# Each ES update: population_size models evaluate the same batch, then parameters are updated once
+tokens_per_batch = device_batch_size * max_seq_len  # tokens per forward pass
+tokens_per_es_update = tokens_per_batch  # all population members see the same batch
+print0(f"Tokens per ES update: {device_batch_size} seqs × {max_seq_len} = {tokens_per_batch:,}")
+print0(f"Population size: {population_size}")
+print0(f"ES evaluations per update: {population_size} models × {tokens_per_batch:,} tokens = {population_size * tokens_per_batch:,} total forward pass tokens")
 
 # -----------------------------------------------------------------------------
 # Initialize the Model
@@ -124,9 +124,13 @@ checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
 resuming = resume_from_step != -1
 if resuming:
     print0(f"Resuming optimization from step {resume_from_step}")
-    model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, resume_from_step, device, load_optimizer=True, rank=ddp_rank)
+    # ES training: no optimizer state to load (ES is stateless)
+    model_data, _, meta_data = load_checkpoint(checkpoint_dir, resume_from_step, device, load_optimizer=False, rank=ddp_rank)
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
+    # Verify base_seed matches if resuming (critical for reproducibility)
+    if "base_seed" in meta_data and meta_data["base_seed"] != base_seed:
+        print0(f"WARNING: Resuming with different base_seed! Checkpoint: {meta_data['base_seed']}, Current: {base_seed}")
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
 model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
@@ -138,32 +142,34 @@ print0(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 # Calculate number of iterations. Either it is given, or from target flops, or from target data:param ratio (in that order)
 assert num_iterations > 0 or target_param_data_ratio > 0 or target_flops > 0
 if num_iterations > 0:
-    print0(f"Using user-provided number of iterations: {num_iterations:,}")
+    print0(f"Using user-provided number of iterations (ES updates): {num_iterations:,}")
 elif target_flops > 0:
     # calculate the number of iterations from the target flops
-    num_iterations = round(target_flops / (num_flops_per_token * total_batch_size))
-    print0(f"Calculated number of iterations from target FLOPs: {num_iterations:,}")
+    num_iterations = round(target_flops / (num_flops_per_token * tokens_per_batch))
+    print0(f"Calculated number of ES updates from target FLOPs: {num_iterations:,}")
 elif target_param_data_ratio > 0:
     # calculate the number of iterations from the target param data ratio
     target_tokens = target_param_data_ratio * num_params
-    num_iterations = target_tokens // total_batch_size
-    print0(f"Calculated number of iterations from target data:param ratio: {num_iterations:,}")
+    num_iterations = target_tokens // tokens_per_batch
+    print0(f"Calculated number of ES updates from target data:param ratio: {num_iterations:,}")
 else:
     raise ValueError("No training horizon specified")
-total_tokens = total_batch_size * num_iterations
+total_tokens = tokens_per_batch * num_iterations
 print0(f"Total number of training tokens: {total_tokens:,}")
-print0(f"Tokens : Params ratio: {total_batch_size * num_iterations / num_params:.2f}") # Chinchilla is ~20
+print0(f"Tokens : Params ratio: {tokens_per_batch * num_iterations / num_params:.2f}") # Chinchilla is ~20
 print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
+print0(f"Note: Each ES update requires {population_size} forward passes (one per population member)")
 
 # -----------------------------------------------------------------------------
-# Initialize the Optimizer (Muon for Linear layers, AdamW for embedding and lm_head)
-optimizers = model.setup_optimizers(unembedding_lr=unembedding_lr, embedding_lr=embedding_lr, matrix_lr=matrix_lr, weight_decay=weight_decay)
-adamw_optimizer, muon_optimizer = optimizers
-
-if resuming:
-    for opt, dat in zip(optimizers, optimizer_data):
-        opt.load_state_dict(dat)
-    del optimizer_data # free up the memory
+# ES Training: No optimizer needed (ES is stateless, updates parameters directly)
+# Verify population size is divisible by world size
+assert population_size % ddp_world_size == 0, \
+    f"population_size ({population_size}) must be divisible by ddp_world_size ({ddp_world_size})"
+print0(f"ES population size: {population_size} ({population_size // ddp_world_size} per rank)")
+print0(f"ES sigma (noise temperature): {sigma}")
+print0(f"ES learning rate: {es_lr}")
+print0(f"ES low-rank dimension: {es_rank}")
+print0(f"ES chunk size: {chunk_size}")
 
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
@@ -176,7 +182,7 @@ x, y, dataloader_state_dict = next(train_loader) # kick off load of the very fir
 # -----------------------------------------------------------------------------
 # Set up hyperparameter schedulers
 
-# Learning rate scheduler
+# Learning rate scheduler (applies to ES learning rate)
 def get_lr_multiplier(it):
     warmup_iters = round(warmup_ratio * num_iterations)
     warmdown_iters = round(warmdown_ratio * num_iterations)
@@ -187,12 +193,6 @@ def get_lr_multiplier(it):
     else:
         progress = (num_iterations - it) / warmdown_iters
         return progress * 1.0 + (1 - progress) * final_lr_frac
-
-# Momentum scheduler for Muon optimizer
-def get_muon_momentum(it):
-    frac = min(it / 300, 1)
-    momentum = (1 - frac) * 0.85 + frac * 0.95
-    return momentum
 
 # -----------------------------------------------------------------------------
 # Loop state (variables updated by the training loop)
@@ -213,7 +213,8 @@ else:
 # Training loop
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
-    flops_so_far = num_flops_per_token * total_batch_size * step
+    # FLOPs calculation for ES: each step does population_size forward passes
+    flops_so_far = num_flops_per_token * tokens_per_batch * population_size * step
 
     # once in a while: evaluate the val bpb (all ranks participate)
     if last_step or step % eval_every == 0:
@@ -276,7 +277,7 @@ while True:
             checkpoint_dir,
             step,
             orig_model.state_dict(), # model parameters
-            [opt.state_dict() for opt in optimizers], # optimizer states
+            [], # ES training: no optimizer states (ES is stateless)
             { # metadata saved as json
                 "step": step,
                 "val_bpb": val_bpb, # loss at last step
@@ -284,6 +285,7 @@ while True:
                 "user_config": user_config, # inputs to the training script
                 "device_batch_size": device_batch_size,
                 "max_seq_len": max_seq_len,
+                "base_seed": base_seed, # save base_seed for reproducibility
                 "dataloader_state_dict": dataloader_state_dict,
                 "loop_state": { # all loop state (other than step) so that we can resume training
                     "min_val_bpb": min_val_bpb,
@@ -299,33 +301,52 @@ while True:
         break
 
     # -------------------------------------------------------------------------
-    # single training step
-    # evaluate the gradient
+    # Single ES training step: evaluate population, compute update, apply
+    # CRITICAL: Model in eval mode (disables dropout, ES provides exploration)
+    model.eval()
+    orig_model.eval()
+    
     synchronize()
     t0 = time.time()
-    for micro_step in range(grad_accum_steps):
-        with autocast_ctx:
-            loss = model(x, y)
-        train_loss = loss.detach() # for logging
-        loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
-        loss.backward()
-        x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
-    # gradient clipping
-    grad_clip_enabled = grad_clip > 0.0
-    if grad_clip_enabled:
-        grad_norm_tensor = torch.nn.utils.clip_grad_norm_(orig_model.parameters(), grad_clip)
-        grad_norm = grad_norm_tensor.item() # GPU tensor -> CPU float (note: cpu-gpu sync point)
-    # step the optimizers
+    
+    # CRITICAL: Use inference_mode to prevent gradient computation (saves VRAM)
+    with torch.inference_mode(), autocast_ctx:
+        # Evaluate population on current batch
+        # All population members evaluate the SAME batch (x, y)
+        # Returns fitness scores and seeds (NOT full perturbations)
+        fitnesses, seeds = model.evaluate_population(
+            x, y,
+            population_size=population_size,
+            sigma=sigma,
+            rank=es_rank,
+            base_seed=base_seed,
+            step=step,  # Unique seed per ES update
+            world_size=ddp_world_size,
+            ddp_rank=ddp_rank,
+            chunk_size=chunk_size
+        )
+    
+    # Compute and apply ES update (outside inference_mode to allow in-place param.data writes)
+    # Get current learning rate (with warmup/warmdown)
     lrm = get_lr_multiplier(step)
-    for opt in optimizers:
-        for group in opt.param_groups:
-            group["lr"] = group["initial_lr"] * lrm
-    muon_momentum = get_muon_momentum(step)
-    for group in muon_optimizer.param_groups:
-        group["momentum"] = muon_momentum
-    for opt in optimizers:
-        opt.step()
-    model.zero_grad(set_to_none=True)
+    current_lr = es_lr * lrm
+    
+    # Import ES update function
+    from nanochat.egroll import es_update_vectorized
+    
+    # Apply ES update (no backward pass needed, no gradients)
+    # NOTE: This modifies parameters directly via param.data
+    # CRITICAL: update_chunk_size must match the chunk_size used in forward pass
+    # to ensure noise consistency between evaluation and update
+    es_update_vectorized(orig_model, fitnesses, seeds, sigma, current_lr, es_rank, weight_decay, update_chunk_size=chunk_size)
+    
+    # For logging: estimate loss from average fitness
+    avg_fitness = fitnesses.mean().item()
+    train_loss = -avg_fitness  # fitness = -loss
+    
+    # Prefetch next batch for next ES update
+    x, y, dataloader_state_dict = next(train_loader)
+    
     synchronize()
     t1 = time.time()
     dt = t1 - t0
@@ -333,17 +354,19 @@ while True:
 
     # logging
     ema_beta = 0.9 # EMA decay factor for some smoothing just for nicer logging
-    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss.item() # EMA the training loss
+    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss # EMA the training loss
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
     pct_done = 100 * step / num_iterations
-    tok_per_sec = int(total_batch_size / dt)
-    flops_per_sec = num_flops_per_token * total_batch_size / dt
+    tok_per_sec = int(tokens_per_batch / dt)  # tokens per second (data throughput)
+    # ES effective throughput: each forward pass is done population_size times
+    es_evals_per_sec = population_size / dt  # population evaluations per second
+    flops_per_sec = num_flops_per_token * tokens_per_batch * population_size / dt  # total FLOPs including all population members
     promised_flops_per_sec_h100 = 989e12 * ddp_world_size # bfloat16 H100 SXM and without 2:4 sparsity
     mfu = 100 * flops_per_sec / promised_flops_per_sec_h100 # in %
     if step > 10:
         total_training_time += dt # only count the time after the first 10 steps
-    print_grad_norm = f" grad norm: {grad_norm:.4f} |" if grad_clip_enabled else ""
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} |{print_grad_norm} lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | total time: {total_training_time/60:.2f}m")
+    # ES training: no gradient norm to log
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | pop_eval/sec: {es_evals_per_sec:.1f} | mfu: {mfu:.2f} | total time: {total_training_time/60:.2f}m")
     if step % 100 == 0:
         log_data = {
             "step": step,
@@ -355,8 +378,6 @@ while True:
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
         }
-        if grad_clip_enabled:
-            log_data["train/grad_norm"] = grad_norm
         wandb_run.log(log_data)
 
     # state update
@@ -374,9 +395,10 @@ get_report().log(section="Base model training", data=[
     { # stats about the training setup
         "Number of parameters": num_params,
         "Number of FLOPs per token": f"{num_flops_per_token:e}",
-        "Calculated number of iterations": num_iterations,
-        "Number of training tokens": total_tokens,
-        "Tokens : Params ratio": total_batch_size * num_iterations / num_params,
+        "ES population size": population_size,
+        "Calculated number of ES updates": num_iterations,
+        "Number of training tokens (data consumed)": total_tokens,
+        "Tokens : Params ratio": tokens_per_batch * num_iterations / num_params,
         "DDP world size": ddp_world_size,
         "warmup_ratio": warmup_ratio,
         "warmdown_ratio": warmdown_ratio,
