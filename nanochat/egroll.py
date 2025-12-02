@@ -14,17 +14,16 @@ Key implementation constraints:
 """
 
 import torch
-import math
 import hashlib
 
 
-def generate_lowrank_noise_factors(param_shape, rank, seed, device='cpu'):
+def generate_lowrank_noise_factors(param_shape, seed, device='cpu'):
     """
     Generate low-rank noise factors (A, B) using deterministic seed.
     
     For parameter W with shape (m, n):
-    - Returns A ∈ R^(m×r), B ∈ R^(n×r)
-    - Perturbation is E = (sigma / sqrt(rank)) * A @ B.T
+    - Returns A ∈ R^m, B ∈ R^n (rank=1 vectors)
+    - Perturbation is E = sigma * A @ B.T (sigma=1.0 implicit, absorbed into lr)
     - Uses per-call Generator for thread-safety and performance
     
     CRITICAL: Uses torch.Generator (NOT global torch.manual_seed):
@@ -38,12 +37,11 @@ def generate_lowrank_noise_factors(param_shape, rank, seed, device='cpu'):
     
     Args:
         param_shape: (m, n) shape of parameter (e.g., [out_features, in_features])
-        rank: Low-rank dimension r
         seed: Deterministic seed for this specific perturbation
         device: torch device
     
     Returns:
-        A, B: Low-rank factors
+        A, B: Low-rank factors (vectors when rank=1)
     """
     m, n = param_shape
     
@@ -51,9 +49,9 @@ def generate_lowrank_noise_factors(param_shape, rank, seed, device='cpu'):
     gen = torch.Generator(device=device)
     gen.manual_seed(seed)
     
-    # Generate factors with i.i.d. N(0,1) entries
-    A = torch.randn(m, rank, generator=gen, device=device)
-    B = torch.randn(n, rank, generator=gen, device=device)
+    # Generate factors with i.i.d. N(0,1) entries (rank=1: vectors, not matrices)
+    A = torch.randn(m, generator=gen, device=device)
+    B = torch.randn(n, generator=gen, device=device)
     
     return A, B
 
@@ -158,25 +156,60 @@ def compute_perturbation_seed(base_seed, step, world_size, population_size, ddp_
 
 
 @torch.no_grad()
-def es_update_vectorized(model, fitnesses, seeds, sigma, lr, rank, weight_decay=0.0, update_chunk_size=256):
+def es_update_vectorized(model, fitnesses, seeds, lr, weight_decay=0.0, update_chunk_size=256):
     """
-    ES update with vectorized chunked noise generation.
+    ES update with vectorized chunked noise generation (rank=1 optimized).
+    
+    Works for both single-GPU and multi-GPU (DDP) training automatically.
+    Detects DDP and uses all_reduce when needed.
     
     Processes multiple members per chunk using batched ops for performance.
     
     Args:
         model: Model to update
         fitnesses: (N,) tensor of fitness scores
-        seeds: (N,) tensor of seeds
-        sigma: Noise temperature
-        lr: Learning rate
-        rank: Low-rank dimension
+                   - Single-GPU: all fitnesses
+                   - Multi-GPU: fitnesses from this rank only (will be used after global normalization)
+        seeds: (N,) tensor of seeds corresponding to fitnesses
+               - Single-GPU: all seeds
+               - Multi-GPU: seeds from this rank only
+        lr: Learning rate (effective step size, sigma already fused into lr)
         weight_decay: Weight decay coefficient
         update_chunk_size: Process this many members at once (balance speed and memory)
+                          CRITICAL: Must match chunk_size used in model.evaluate_population()
+                          to ensure noise consistency between forward and update!
+    
+    Note: For multi-GPU, caller should pass all_fitnesses (after all_gather) for normalization,
+          but only local seeds. This function will extract the relevant local_fitnesses slice.
+    Note: rank=1 is hardcoded for optimization (1/sqrt(1)=1.0, vectors instead of matrices).
+    Note: sigma is fused into lr, so update formula is: W += (lr / N) * Σ fitness_i * A_i @ B_i^T
     """
-    # Normalize fitnesses
+    # Detect if we're in DDP mode
+    import torch.distributed as dist
+    is_distributed = dist.is_available() and dist.is_initialized()
+    
+    if is_distributed:
+        world_size = dist.get_world_size()
+        rank_id = dist.get_rank()
+    else:
+        world_size = 1
+        rank_id = 0
+    
+    # Normalize fitnesses using full distribution
     norm_fit = (fitnesses - fitnesses.mean()) / (fitnesses.std() + 1e-8)
-    N = len(fitnesses)
+    
+    # For multi-GPU: extract local fitnesses corresponding to local seeds
+    # For single-GPU: N_total == N_local, so this is just identity
+    N_total = len(fitnesses)
+    N_local = len(seeds)
+    
+    if is_distributed:
+        # Extract local slice from normalized fitnesses
+        start_idx = rank_id * N_local
+        local_norm_fit = norm_fit[start_idx:start_idx + N_local]
+    else:
+        local_norm_fit = norm_fit
+    
     device = fitnesses.device
     
     for name, p in model.named_parameters():
@@ -187,14 +220,14 @@ def es_update_vectorized(model, fitnesses, seeds, sigma, lr, rank, weight_decay=
             m, n = p.shape
             update = torch.zeros_like(p.data)
             
-            # Process population in chunks
-            for chunk_start in range(0, N, update_chunk_size):
-                chunk_end = min(chunk_start + update_chunk_size, N)
+            # Process local population in chunks
+            for chunk_start in range(0, N_local, update_chunk_size):
+                chunk_end = min(chunk_start + update_chunk_size, N_local)
                 chunk_size = chunk_end - chunk_start
                 
                 # Get chunk of seeds and fitnesses
                 seeds_chunk = seeds[chunk_start:chunk_end]
-                norm_fit_chunk = norm_fit[chunk_start:chunk_end]
+                norm_fit_chunk = local_norm_fit[chunk_start:chunk_end]
                 
                 # VECTORIZED: Generate noise for entire chunk with ONE generator
                 # CRITICAL: Derive from first member's seed (same as forward pass)
@@ -203,21 +236,29 @@ def es_update_vectorized(model, fitnesses, seeds, sigma, lr, rank, weight_decay=
                 gen.manual_seed(chunk_seed)
                 
                 # Two big randn calls instead of many small ones
-                # [chunk_size, m, rank] and [chunk_size, n, rank]
+                # rank=1: [chunk_size, m] and [chunk_size, n] (vectors, not matrices)
                 # CRITICAL: Use same dtype as parameters to match forward pass noise generation
-                A_chunk = torch.randn(chunk_size, m, rank, generator=gen, device=device, dtype=p.dtype)
-                B_chunk = torch.randn(chunk_size, n, rank, generator=gen, device=device, dtype=p.dtype)
+                A_chunk = torch.randn(chunk_size, m, generator=gen, device=device, dtype=p.dtype)
+                B_chunk = torch.randn(chunk_size, n, generator=gen, device=device, dtype=p.dtype)
                 
-                # Scale A by fitness: [chunk_size, m, rank]
+                # Scale A by fitness: [chunk_size, m]
                 # CRITICAL: Cast norm_fit to same dtype as noise to avoid einsum dtype mismatch
-                A_scaled = A_chunk * norm_fit_chunk.to(p.dtype).view(chunk_size, 1, 1)
+                A_scaled = A_chunk * norm_fit_chunk.to(p.dtype).view(chunk_size, 1)
                 
-                # Compute batched outer products and sum using einsum (most efficient)
-                chunk_update = torch.einsum('cmi,cni->mn', A_scaled, B_chunk)
+                # Compute batched outer products and sum using einsum (rank=1 optimized)
+                # 'cm,cn->mn' is outer product: sum over chunk dimension
+                chunk_update = torch.einsum('cm,cn->mn', A_scaled, B_chunk)
                 update.add_(chunk_update)
             
-            # Scale and apply update
-            scaling = lr / (sigma * math.sqrt(rank) * N)
+            # Multi-GPU: all-reduce to combine contributions from all ranks
+            if is_distributed:
+                dist.all_reduce(update, op=dist.ReduceOp.SUM)
+            
+            # Scale and apply update (use N_total for proper scaling)
+            # Update formula: W += (lr / N) * Σ fitness_i * A_i @ B_i^T
+            # Note: sigma is fused into lr, so no division by sigma here
+            # rank=1: sqrt(1)=1.0, so no sqrt division needed
+            scaling = lr / N_total
             p.data.add_(update, alpha=scaling)
             
             # Weight decay
@@ -235,10 +276,10 @@ def es_update_vectorized(model, fitnesses, seeds, sigma, lr, rank, weight_decay=
             layer_hash = stable_hash_name(normalized_name)
             update = torch.zeros_like(p.data)
             
-            for chunk_start in range(0, N, update_chunk_size):
-                chunk_end = min(chunk_start + update_chunk_size, N)
+            for chunk_start in range(0, N_local, update_chunk_size):
+                chunk_end = min(chunk_start + update_chunk_size, N_local)
                 seeds_chunk = seeds[chunk_start:chunk_end]
-                norm_fit_chunk = norm_fit[chunk_start:chunk_end]
+                norm_fit_chunk = local_norm_fit[chunk_start:chunk_end]
                 chunk_size_actual = chunk_end - chunk_start
                 
                 # CRITICAL: Derive chunk seed from first member (same as forward pass)
@@ -252,7 +293,14 @@ def es_update_vectorized(model, fitnesses, seeds, sigma, lr, rank, weight_decay=
                 weighted = epsilon_chunk * norm_fit_chunk.to(p.dtype).view(chunk_size_actual, *([1] * len(p.shape)))
                 update.add_(weighted.sum(dim=0))
             
-            scaling = lr / (sigma * N)
+            # Multi-GPU: all-reduce to combine contributions
+            if is_distributed:
+                dist.all_reduce(update, op=dist.ReduceOp.SUM)
+            
+            # Scale and apply update (use N_total for proper scaling)
+            # Update formula: W += (lr / N) * Σ fitness_i * epsilon_i
+            # Note: sigma is fused into lr, so no division by sigma here
+            scaling = lr / N_total
             p.data.add_(update, alpha=scaling)
             
             if weight_decay > 0:
@@ -260,12 +308,22 @@ def es_update_vectorized(model, fitnesses, seeds, sigma, lr, rank, weight_decay=
 
 
 @torch.no_grad()
-def accumulate_micro_population_vectorized(model, fitnesses, seeds, sigma, rank, 
+def accumulate_micro_population_vectorized(model, fitnesses, seeds, sigma,
                                           accumulated_updates, update_chunk_size=256):
     """
     Accumulate fitness-weighted perturbations using chunk-level RNG and batched operations.
     
     Used for temporal accumulation to achieve large effective population sizes.
+    Note: sigma is used to scale perturbations in forward pass, then normalized in es_update_with_accumulation.
+    Note: rank=1 is hardcoded for optimization.
+    
+    Args:
+        model: Model (not modified, used for parameter iteration)
+        fitnesses: (M,) tensor of fitness scores
+        seeds: (M,) tensor of seeds
+        sigma: Noise temperature (perturbation scale used in forward pass)
+        accumulated_updates: Dict to accumulate updates into
+        update_chunk_size: Process this many members at once
     """
     norm_fit = (fitnesses - fitnesses.mean()) / (fitnesses.std() + 1e-8)
     M = len(fitnesses)
@@ -295,15 +353,15 @@ def accumulate_micro_population_vectorized(model, fitnesses, seeds, sigma, rank,
                 gen = torch.Generator(device=device)
                 gen.manual_seed(chunk_seed)
                 
-                # Two big randn calls
+                # Two big randn calls (rank=1: vectors, not matrices)
                 # CRITICAL: Use same dtype as parameters to match forward pass noise generation
-                A_chunk = torch.randn(chunk_size, m, rank, generator=gen, device=device, dtype=p.dtype)
-                B_chunk = torch.randn(chunk_size, n, rank, generator=gen, device=device, dtype=p.dtype)
+                A_chunk = torch.randn(chunk_size, m, generator=gen, device=device, dtype=p.dtype)
+                B_chunk = torch.randn(chunk_size, n, generator=gen, device=device, dtype=p.dtype)
                 # CRITICAL: Cast norm_fit to same dtype to avoid einsum dtype mismatch
-                A_scaled = A_chunk * norm_fit_chunk.to(p.dtype).view(chunk_size, 1, 1)
+                A_scaled = A_chunk * norm_fit_chunk.to(p.dtype).view(chunk_size, 1)
                 
-                # Accumulate using einsum (most efficient)
-                chunk_update = torch.einsum('cmi,cni->mn', A_scaled, B_chunk)
+                # Accumulate using einsum (rank=1 optimized)
+                chunk_update = torch.einsum('cm,cn->mn', A_scaled, B_chunk)
                 accumulated_updates[name].add_(chunk_update)
         
         elif p.ndim == 1:
@@ -339,7 +397,7 @@ def accumulate_micro_population_vectorized(model, fitnesses, seeds, sigma, rank,
 
 
 @torch.no_grad()
-def es_update_with_accumulation(model, accumulated_updates, N_total, sigma, lr, rank, weight_decay=0.0):
+def es_update_with_accumulation(model, accumulated_updates, N_total, sigma, lr, weight_decay=0.0):
     """
     Apply ES update after accumulating fitness-weighted perturbations across micro-populations.
     
@@ -349,15 +407,19 @@ def es_update_with_accumulation(model, accumulated_updates, N_total, sigma, lr, 
         model: Model to update
         accumulated_updates: Dict of accumulated fitness-weighted noise per parameter
         N_total: Total effective population size (sum of all micro-population sizes)
-        sigma: Noise temperature
-        lr: Learning rate
-        rank: Low-rank dimension
+        sigma: Noise temperature (perturbation scale used in forward pass; not used in update scaling)
+        lr: Learning rate (effective step size, sigma already fused into lr)
         weight_decay: Weight decay coefficient
+    Note: rank=1 is hardcoded for optimization.
+    Note: sigma is fused into lr, so update formula is: W += (lr / N) * accumulated_update
     """
     for name, p in model.named_parameters():
         if p.ndim == 2 and name in accumulated_updates:
             # Scale accumulated update by ES formula
-            scaling = lr / (sigma * math.sqrt(rank) * N_total)
+            # Update formula: W += (lr / N) * accumulated_update
+            # Note: sigma is fused into lr, so no division by sigma here
+            # rank=1: sqrt(1)=1.0, so no sqrt division needed
+            scaling = lr / N_total
             p.data.add_(accumulated_updates[name], alpha=scaling)
             
             # Apply weight decay
@@ -370,7 +432,9 @@ def es_update_with_accumulation(model, accumulated_updates, N_total, sigma, lr, 
             # continue
             
             if name in accumulated_updates:
-                scaling = lr / (sigma * N_total)
+                # Update formula: W += (lr / N) * accumulated_update
+                # Note: sigma is fused into lr, so no division by sigma here
+                scaling = lr / N_total
                 p.data.add_(accumulated_updates[name], alpha=scaling)
                 
                 if weight_decay > 0:

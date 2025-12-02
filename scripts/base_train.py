@@ -45,9 +45,9 @@ target_param_data_ratio = 20 # calculate num_iterations to maintain fixed data:p
 device_batch_size = 32 # sequences per forward pass (set to not OOM)
 # ES hyperparameters
 population_size = 256 # ES population size per update (start small, scale up; paper uses 262144)
-sigma = 1.0 # ES noise temperature (controls perturbation magnitude in forward pass)
-es_lr = 0.02 # ES effective learning rate (tuned step size, independent of sigma)
-es_rank = 1 # Low-rank perturbation rank (r in paper, typically 1)
+sigma = 0.1 # Noise temperature (perturbation scale; use 0.1 for bfloat16, 0.01 for float32)
+es_lr = 0.02 # ES learning rate (effective step size)
+# rank=1 is hardcoded for optimization (removed es_rank parameter)
 weight_decay = 0.0 # weight decay (applied as decoupled weight decay like AdamW)
 base_seed = 42 # base random seed for deterministic noise generation
 chunk_size = 8 # ES population chunk size (memory vs speed tradeoff; start conservative)
@@ -105,6 +105,21 @@ tokens_per_es_update = tokens_per_batch  # all population members see the same b
 print0(f"Tokens per ES update: {device_batch_size} seqs × {max_seq_len} = {tokens_per_batch:,}")
 print0(f"Population size: {population_size}")
 print0(f"ES evaluations per update: {population_size} models × {tokens_per_batch:,} tokens = {population_size * tokens_per_batch:,} total forward pass tokens")
+
+# Automatic learning rate scaling for population size
+# The ES formula lr / (σ√r·N) has 1/N term, so larger populations reduce effective step size
+# We use SQRT scaling (not linear) because:
+# - Larger populations give better gradient estimates (can use larger steps)
+# - But linear scaling is too aggressive (causes divergence)
+# - Square root is a conservative middle ground
+reference_population = 256  # Baseline population for es_lr tuning
+es_lr_base = es_lr  # Store original for logging
+import math
+scaling_factor = math.sqrt(population_size / reference_population)
+es_lr = es_lr * scaling_factor
+print0(f"ES learning rate (base): {es_lr_base}")
+print0(f"ES learning rate (scaling factor): {scaling_factor:.4f} (sqrt scaling)")
+print0(f"ES learning rate (scaled for pop={population_size}): {es_lr:.6f}")
 
 # -----------------------------------------------------------------------------
 # Initialize the Model
@@ -167,8 +182,8 @@ assert population_size % ddp_world_size == 0, \
     f"population_size ({population_size}) must be divisible by ddp_world_size ({ddp_world_size})"
 print0(f"ES population size: {population_size} ({population_size // ddp_world_size} per rank)")
 print0(f"ES sigma (noise temperature): {sigma}")
-print0(f"ES learning rate: {es_lr}")
-print0(f"ES low-rank dimension: {es_rank}")
+print0(f"ES learning rate: {es_lr} (auto-scaled from base {es_lr_base} for population {population_size})")
+print0(f"ES low-rank dimension: 1 (hardcoded for optimization)")
 print0(f"ES chunk size: {chunk_size}")
 
 # -----------------------------------------------------------------------------
@@ -313,18 +328,31 @@ while True:
     with torch.inference_mode(), autocast_ctx:
         # Evaluate population on current batch
         # All population members evaluate the SAME batch (x, y)
-        # Returns fitness scores and seeds (NOT full perturbations)
+        # Returns LOCAL fitness scores and seeds (NOT full perturbations)
+        # In distributed: each rank evaluates population_size // world_size members
         fitnesses, seeds = model.evaluate_population(
             x, y,
             population_size=population_size,
             sigma=sigma,
-            rank=es_rank,
             base_seed=base_seed,
             step=step,  # Unique seed per ES update
             world_size=ddp_world_size,
             ddp_rank=ddp_rank,
             chunk_size=chunk_size
         )
+    
+    # Synchronize fitnesses across all ranks (DDP only)
+    # All ranks need full fitness distribution for proper normalization
+    if ddp:
+        import torch.distributed as dist
+        # Gather fitnesses from all ranks into a single tensor
+        # Each rank contributes population_size // world_size fitnesses
+        all_fitnesses = torch.empty(population_size, device=device, dtype=fitnesses.dtype)
+        dist.all_gather_into_tensor(all_fitnesses, fitnesses)
+        if step == 0 and master_process:
+            print0(f"Distributed ES: Each rank evaluated {len(fitnesses)} members, gathered {len(all_fitnesses)} total")
+    else:
+        all_fitnesses = fitnesses
     
     # Compute and apply ES update (outside inference_mode to allow in-place param.data writes)
     # Get current learning rate (with warmup/warmdown)
@@ -334,15 +362,34 @@ while True:
     # Import ES update function
     from nanochat.egroll import es_update_vectorized
     
-    # Apply ES update (no backward pass needed, no gradients)
+    # Apply ES update (works for both single-GPU and multi-GPU automatically)
     # NOTE: This modifies parameters directly via param.data
-    # CRITICAL: update_chunk_size must match the chunk_size used in forward pass
-    # to ensure noise consistency between evaluation and update
-    es_update_vectorized(orig_model, fitnesses, seeds, sigma, current_lr, es_rank, weight_decay, update_chunk_size=chunk_size)
+    # CRITICAL: update_chunk_size MUST EQUAL chunk_size from evaluate_population!
+    # This ensures RNG seed alignment between forward pass and parameter update.
+    # If these don't match, each fitness will be correlated with the WRONG noise,
+    # completely breaking the ES gradient estimator and causing "loss not going down" issues.
+    # For multi-GPU: pass all_fitnesses (global) and seeds (local), function handles the rest
+    if step == 0 and master_process:
+        print0(f"[Diagnostic] ES update: chunk_size={chunk_size}, len(seeds)={len(seeds)}, len(all_fitnesses)={len(all_fitnesses)}")
+    es_update_vectorized(orig_model, all_fitnesses, seeds, current_lr, weight_decay, 
+                        update_chunk_size=chunk_size)
     
     # For logging: estimate loss from average fitness
-    avg_fitness = fitnesses.mean().item()
+    # Use all_fitnesses for accurate global loss (includes all ranks)
+    avg_fitness = all_fitnesses.mean().item()
     train_loss = -avg_fitness  # fitness = -loss
+    
+    # Diagnostic: Check if population has variation (critical for ES!)
+    if step < 5:  # Only log first few steps
+        fitness_std = all_fitnesses.std().item()
+        fitness_range = (all_fitnesses.max() - all_fitnesses.min()).item()
+        if master_process:
+            print0(f"  [Diagnostic] Fitness std={fitness_std:.6f}, range={fitness_range:.6f}, unique_losses={len(torch.unique(-all_fitnesses))}")
+            if fitness_std < 1e-6:
+                print0(f"  [WARNING] No fitness variation! All population members identical!")
+                print0(f"  [WARNING] ES cannot learn. Check: sigma too small? perturbations not applied?")
+            elif fitness_std < 0.01:
+                print0(f"  [WARNING] Very small fitness variation. Consider increasing sigma.")
     
     # Prefetch next batch for next ES update
     x, y, dataloader_state_dict = next(train_loader)
@@ -396,6 +443,12 @@ get_report().log(section="Base model training", data=[
         "Number of parameters": num_params,
         "Number of FLOPs per token": f"{num_flops_per_token:e}",
         "ES population size": population_size,
+        "ES sigma (noise temperature)": sigma,
+        "ES learning rate (base)": es_lr_base,
+        "ES learning rate (scaled)": es_lr,
+        "ES LR scaling factor": scaling_factor,
+        "ES LR scaling method": "sqrt",
+        "ES rank": 1,
         "Calculated number of ES updates": num_iterations,
         "Number of training tokens (data consumed)": total_tokens,
         "Tokens : Params ratio": tokens_per_batch * num_iterations / num_params,

@@ -277,7 +277,7 @@ class GPT(nn.Module):
     # These methods are used ONLY during ES training, not during standard inference
 
     @torch.inference_mode()
-    def evaluate_population(self, idx, targets, population_size, sigma, rank=1, base_seed=0, step=0,
+    def evaluate_population(self, idx, targets, population_size, sigma, base_seed=0, step=0,
                            world_size=1, ddp_rank=0, chunk_size=8):
         """
         Evaluate a population of perturbed models (TRAINING ONLY) with CHUNKED batching.
@@ -289,12 +289,17 @@ class GPT(nn.Module):
         IMPORTANT: Does NOT store perturbations in memory. Uses deterministic seeds
         to regenerate noise on-the-fly during forward pass and again during ES update.
         
+        DISTRIBUTED: Each rank evaluates only its subset of the population.
+        For example, with 8 GPUs and population_size=512:
+        - Rank 0: evaluates members 0-63 (64 members)
+        - Rank 1: evaluates members 64-127 (64 members)
+        - ... and so on
+        
         Args:
             idx: Input token indices [batch_size, seq_len]
             targets: Target tokens [batch_size, seq_len]
-            population_size: Number of population members to evaluate (must be divisible by world_size)
+            population_size: TOTAL population size across all ranks (must be divisible by world_size)
             sigma: Noise temperature (perturbation scale)
-            rank: Low-rank perturbation rank (r in paper, typically 1)
             base_seed: Base random seed for reproducibility
             step: Current training step (for seed coordination)
             world_size: Number of distributed ranks (1 for single-GPU)
@@ -306,29 +311,39 @@ class GPT(nn.Module):
                         Start conservative (8-16), increase if memory allows
         
         Returns:
-            fitnesses: (population_size,) tensor of fitness scores
-            seeds: (population_size,) tensor of seeds used (for ES update)
+            fitnesses: (population_per_rank,) tensor of LOCAL fitness scores
+            seeds: (population_per_rank,) tensor of LOCAL seeds used (for ES update)
+        
+        Note: rank=1 is hardcoded for optimization.
+        Perturbations are scaled by sigma: E = sigma * A @ B^T
         """
         from nanochat.egroll import compute_perturbation_seed
         
         device = idx.device
         batch_size, seq_len = idx.shape
         
-        # CRITICAL: Verify population divides evenly (assertion in helper will catch this)
-        # Generate seeds for each population member using centralized helper
-        seeds = torch.zeros(population_size, dtype=torch.int64, device=device)
-        for i in range(population_size):
+        # CRITICAL: Verify population divides evenly across ranks
+        assert population_size % world_size == 0, \
+            f"population_size ({population_size}) must be divisible by world_size ({world_size})"
+        
+        # Calculate local population size for this rank
+        population_per_rank = population_size // world_size
+        
+        # Generate seeds for LOCAL population members only
+        # Each rank generates different seeds based on its ddp_rank
+        seeds = torch.zeros(population_per_rank, dtype=torch.int64, device=device)
+        for i in range(population_per_rank):
             seeds[i] = compute_perturbation_seed(
                 base_seed, step, world_size, population_size, ddp_rank, i
             )
         
-        # Allocate output fitnesses
-        fitnesses = torch.empty(population_size, device=device)
+        # Allocate output fitnesses for LOCAL population only
+        fitnesses = torch.empty(population_per_rank, device=device)
         
-        # CRITICAL: Process population in chunks to avoid OOM
+        # CRITICAL: Process LOCAL population in chunks to avoid OOM
         # Never materialize [pop, B, T, vocab] at once!
-        for chunk_start in range(0, population_size, chunk_size):
-            chunk_end = min(chunk_start + chunk_size, population_size)
+        for chunk_start in range(0, population_per_rank, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, population_per_rank)
             chunk_pop_size = chunk_end - chunk_start
             
             # Get seeds for this chunk
@@ -340,7 +355,7 @@ class GPT(nn.Module):
             
             # Forward pass with batched perturbations for this chunk only
             # Shape: [chunk_size, batch_size, seq_len, vocab_size]
-            logits_chunk = self._forward_batched_population(idx_chunk, seeds_chunk, sigma, rank)
+            logits_chunk = self._forward_batched_population(idx_chunk, seeds_chunk, sigma)
             
             # Compute loss for each population member in chunk
             # Reshape: [chunk * batch * seq, vocab] and [chunk * batch * seq]
@@ -362,9 +377,9 @@ class GPT(nn.Module):
         return fitnesses, seeds
 
     @torch.inference_mode()
-    def _forward_batched_population(self, idx, seeds, sigma, rank):
+    def _forward_batched_population(self, idx, seeds, sigma):
         """
-        Forward pass with batched low-rank perturbations (TRAINING ONLY).
+        Forward pass with batched low-rank perturbations (TRAINING ONLY, rank=1 optimized).
         
         All population members are processed in parallel using batched operations.
         Perturbations are generated on-the-fly using deterministic seeds.
@@ -372,11 +387,13 @@ class GPT(nn.Module):
         Args:
             idx: Input tokens [population_size, batch_size, seq_len]
             seeds: Seeds for each population member [population_size]
-            sigma: Noise temperature
-            rank: Low-rank perturbation rank
+            sigma: Noise temperature (perturbation scale)
         
         Returns:
             logits: [population_size, batch_size, seq_len, vocab_size]
+        
+        Note: rank=1 is hardcoded for optimization.
+        Perturbations are scaled by sigma: E = sigma * A @ B^T
         """
         pop_size, batch_size, seq_len = idx.shape
         device = idx.device
@@ -403,39 +420,32 @@ class GPT(nn.Module):
         
         layer_hash = stable_hash_name('transformer.wte')
         vocab_size, n_embd = self.transformer.wte.weight.shape
-        scaling = sigma / math.sqrt(rank)
+        # rank=1: sqrt(1)=1.0, so no sqrt scaling needed
+        # Perturbations are scaled by sigma: E = sigma * A @ B^T
         
         x = base_emb.clone()
         
-        # Chunk population for memory efficiency
-        noise_chunk_size = min(pop_size, 64)
-        for chunk_start in range(0, pop_size, noise_chunk_size):
-            chunk_end = min(chunk_start + noise_chunk_size, pop_size)
-            chunk_size_actual = chunk_end - chunk_start
-            
-            # Derive chunk seed from first member's seed
-            seeds_chunk = seeds[chunk_start:chunk_end]
-            chunk_seed = int(seeds_chunk[0].item()) + layer_hash
-            gen = torch.Generator(device=device)
-            gen.manual_seed(chunk_seed)
-            
-            # Generate low-rank factors for the embedding matrix
-            # A: [chunk, vocab, rank], B: [chunk, n_embd, rank]
-            # Generate in the same dtype as base_emb for consistency
-            A_chunk = torch.randn(chunk_size_actual, vocab_size, rank, generator=gen, device=device, dtype=base_emb.dtype)
-            B_chunk = torch.randn(chunk_size_actual, n_embd, rank, generator=gen, device=device, dtype=base_emb.dtype)
-            
-            # Index A using idx to get noise factors for tokens in sequence
-            idx_chunk = idx[chunk_start:chunk_end]  # [chunk, batch, seq]
-            
-            # For each member in chunk, gather A values for its tokens
-            for c in range(chunk_size_actual):
-                # A_indexed: [batch, seq, rank]
-                A_indexed = A_chunk[c][idx_chunk[c]]
-                # B: [n_embd, rank] -> B^T: [rank, n_embd]
-                # Perturbation: A_indexed @ B^T = [batch, seq, rank] @ [rank, n_embd] = [batch, seq, n_embd]
-                emb_pert = scaling * torch.matmul(A_indexed, B_chunk[c].t())
-                x[chunk_start + c] += emb_pert
+        # Generate noise for entire population at once
+        # Derive chunk seed from first member's seed
+        chunk_seed = int(seeds[0].item()) + layer_hash
+        gen = torch.Generator(device=device)
+        gen.manual_seed(chunk_seed)
+        
+        # Generate low-rank factors for the embedding matrix (rank=1: vectors)
+        # A: [pop, vocab], B: [pop, n_embd]
+        # Generate in the same dtype as base_emb for consistency
+        A_chunk = torch.randn(pop_size, vocab_size, generator=gen, device=device, dtype=base_emb.dtype)
+        B_chunk = torch.randn(pop_size, n_embd, generator=gen, device=device, dtype=base_emb.dtype)
+        
+        # For each member, gather A values for its tokens and compute perturbation
+        for c in range(pop_size):
+            # A_indexed: [batch, seq] (rank=1: vector, not matrix)
+            A_indexed = A_chunk[c][idx[c]]
+            # B: [n_embd] (rank=1: vector)
+            # Perturbation: sigma * (A_indexed @ B^T) = sigma * [batch, seq] @ [n_embd] = [batch, seq, n_embd]
+            # Using outer product: A_indexed.unsqueeze(-1) * B_chunk[c] broadcasts correctly
+            emb_pert = sigma * (A_indexed.unsqueeze(-1) * B_chunk[c])
+            x[c] += emb_pert
         
         # Initial norm
         x = norm(x)  # Applies independently per population member
@@ -447,7 +457,7 @@ class GPT(nn.Module):
         
         # Transformer blocks with batched perturbations
         for block_idx, block in enumerate(self.transformer.h):
-            x = self._forward_block_batched(x, block, block_idx, seeds, sigma, rank, cos_sin)
+            x = self._forward_block_batched(x, block, block_idx, seeds, sigma, cos_sin)
         
         # Final norm
         x = norm(x)
@@ -455,7 +465,7 @@ class GPT(nn.Module):
         # Output projection (LM head) with perturbations
         logits = self._linear_batched_lowrank(
             x, self.lm_head.weight, None,
-            layer_name='lm_head', seeds=seeds, sigma=sigma, rank=rank
+            layer_name='lm_head', seeds=seeds, sigma=sigma
         )
         
         # Apply softcap (same as standard forward)
@@ -464,21 +474,23 @@ class GPT(nn.Module):
         
         return logits
 
-    def _forward_block_batched(self, x, block, block_idx, seeds, sigma, rank, cos_sin):
+    def _forward_block_batched(self, x, block, block_idx, seeds, sigma, cos_sin):
         """
-        Forward through one transformer block with batched perturbations.
+        Forward through one transformer block with batched perturbations (rank=1 optimized).
         
         Args:
             x: [pop, batch, seq, n_embd]
             block: Block module
             block_idx: Index of this block (for seed coordination)
             seeds: [pop] seeds for noise generation
-            sigma: Noise temperature
-            rank: Low-rank dimension
+            sigma: Noise temperature (perturbation scale)
             cos_sin: Tuple of (cos, sin) rotary embeddings
         
         Returns:
             x: [pop, batch, seq, n_embd]
+        
+        Note: rank=1 is hardcoded for optimization.
+        Perturbations are scaled by sigma: E = sigma * A @ B^T
         """
         pop_size, batch_size, seq_len, n_embd = x.shape
         device = x.device
@@ -500,8 +512,7 @@ class GPT(nn.Module):
             None,
             layer_name=f"h.{block_idx}.attn.c_q",
             seeds=seeds,
-            sigma=sigma,
-            rank=rank
+            sigma=sigma
         )  # [pop, batch, seq, n_head * head_dim]
         
         # Key projection with perturbations
@@ -511,8 +522,7 @@ class GPT(nn.Module):
             None,
             layer_name=f"h.{block_idx}.attn.c_k",
             seeds=seeds,
-            sigma=sigma,
-            rank=rank
+            sigma=sigma
         )  # [pop, batch, seq, n_kv_head * head_dim]
         
         # Value projection with perturbations
@@ -522,8 +532,7 @@ class GPT(nn.Module):
             None,
             layer_name=f"h.{block_idx}.attn.c_v",
             seeds=seeds,
-            sigma=sigma,
-            rank=rank
+            sigma=sigma
         )  # [pop, batch, seq, n_kv_head * head_dim]
         
         # Reshape for multi-head attention
@@ -588,8 +597,7 @@ class GPT(nn.Module):
             None,
             layer_name=f"h.{block_idx}.attn.c_proj",
             seeds=seeds,
-            sigma=sigma,
-            rank=rank
+            sigma=sigma
         )  # [pop, batch, seq, n_embd]
         
         # Residual connection
@@ -607,8 +615,7 @@ class GPT(nn.Module):
             None,
             layer_name=f"h.{block_idx}.mlp.c_fc",
             seeds=seeds,
-            sigma=sigma,
-            rank=rank
+            sigma=sigma
         )  # [pop, batch, seq, 4*n_embd]
         
         # Activation (ReLU^2)
@@ -621,8 +628,7 @@ class GPT(nn.Module):
             None,
             layer_name=f"h.{block_idx}.mlp.c_proj",
             seeds=seeds,
-            sigma=sigma,
-            rank=rank
+            sigma=sigma
         )  # [pop, batch, seq, n_embd]
         
         # Residual connection
@@ -630,15 +636,16 @@ class GPT(nn.Module):
         
         return x  # [pop, batch, seq, n_embd]
 
-    def _linear_batched_lowrank(self, x, weight, bias, layer_name, seeds, sigma, rank):
+    def _linear_batched_lowrank(self, x, weight, bias, layer_name, seeds, sigma):
         """
-        Batched linear transformation with low-rank perturbations.
+        Batched linear transformation with low-rank perturbations (rank=1 optimized).
         
         Applies: y = x @ (W + E)^T + b
-        where E = (sigma / sqrt(rank)) * A @ B^T
+        where E = sigma * A @ B^T (rank=1: no sqrt scaling needed)
         
-        Efficient implementation:
-        y = x @ W^T + (sigma / sqrt(rank)) * (x @ B) @ A^T + b
+        Efficient implementation for rank=1:
+        y = x @ W^T + sigma * (x @ B) * A + b
+        where A is [chunk, out_features] and B is [chunk, in_features] (vectors)
         
         CRITICAL: Uses stable hash for layer offsets (not Python hash())
         and per-call Generator for noise (not global RNG state).
@@ -649,11 +656,13 @@ class GPT(nn.Module):
             bias: Optional bias [out_features] (usually None in this model)
             layer_name: Name for seed coordination
             seeds: [pop] base seeds for each population member
-            sigma: Noise temperature
-            rank: Low-rank dimension
+            sigma: Noise temperature (perturbation scale)
         
         Returns:
             y: Output [pop, ..., out_features]
+        
+        Note: rank=1 is hardcoded for optimization.
+        Perturbations are scaled by sigma: E = sigma * A @ B^T
         """
         from nanochat.egroll import stable_hash_name
         
@@ -672,51 +681,49 @@ class GPT(nn.Module):
         # CRITICAL: Use STABLE hash (not Python's hash which is randomized)
         layer_hash = stable_hash_name(layer_name)
         
-        scaling = sigma / math.sqrt(rank)
+        # rank=1: sqrt(1)=1.0, so no sqrt scaling needed
+        # Perturbations are scaled by sigma: E = sigma * A @ B^T
         
-        # Generate noise in chunks to balance memory and speed
-        noise_chunk_size = min(pop_size, 64)  # Process 64 members at a time for noise
-        y_pert = torch.zeros_like(y_base)
+        # Generate noise for entire population at once
+        # CRITICAL: Derive chunk seed from first member's seed (not just layer_hash)
+        # This ensures noise depends on (base_seed, step, member_idx) via compute_perturbation_seed
+        chunk_seed = int(seeds[0].item()) + layer_hash
         
-        for chunk_start in range(0, pop_size, noise_chunk_size):
-            chunk_end = min(chunk_start + noise_chunk_size, pop_size)
-            chunk_size_actual = chunk_end - chunk_start
-            
-            # VECTORIZED NOISE GENERATION:
-            # Create ONE generator per chunk, not per member
-            
-            # CRITICAL: Derive chunk seed from first member's seed (not just layer_hash)
-            # This ensures noise depends on (base_seed, step, member_idx) via compute_perturbation_seed
-            seeds_chunk = seeds[chunk_start:chunk_end]
-            chunk_seed = int(seeds_chunk[0].item()) + layer_hash
-            
-            # Create ONE generator for entire chunk
-            gen = torch.Generator(device=device)
-            gen.manual_seed(chunk_seed)
-            
-            # Generate noise for ALL members in chunk at once (two big randn calls)
-            # [chunk_size, out_features, rank] and [chunk_size, in_features, rank]
-            # Generate in the same dtype as x for consistency
-            A_chunk = torch.randn(chunk_size_actual, out_features, rank, generator=gen, device=device, dtype=x.dtype)
-            B_chunk = torch.randn(chunk_size_actual, in_features, rank, generator=gen, device=device, dtype=x.dtype)
-            
-            # Apply perturbation: (x @ B) @ A^T
-            # x_chunk: [chunk, batch, seq, in_features]
-            # B_chunk: [chunk, in_features, rank]
-            x_chunk = x[chunk_start:chunk_end]
-            
-            # Reshape for batched matmul: [chunk, batch*seq, in_features]
-            orig_shape = x_chunk.shape
-            x_chunk_flat = x_chunk.reshape(chunk_size_actual, -1, in_features)
-            
-            # x @ B: [chunk, batch*seq, rank]
-            xB = torch.bmm(x_chunk_flat, B_chunk)
-            
-            # (x @ B) @ A^T: [chunk, batch*seq, out_features]
-            xBA = torch.bmm(xB, A_chunk.transpose(1, 2))
-            
-            # Reshape back and scale
-            y_pert[chunk_start:chunk_end] = scaling * xBA.reshape(orig_shape[:-1] + (out_features,))
+        # Create ONE generator for entire population
+        gen = torch.Generator(device=device)
+        gen.manual_seed(chunk_seed)
+        
+        # Generate noise for ALL members at once (rank=1: vectors, not matrices)
+        # [pop_size, out_features] and [pop_size, in_features]
+        # Generate in the same dtype as x for consistency
+        A_chunk = torch.randn(pop_size, out_features, generator=gen, device=device, dtype=x.dtype)
+        B_chunk = torch.randn(pop_size, in_features, generator=gen, device=device, dtype=x.dtype)
+        
+        # Apply perturbation for rank=1: sigma * (x @ B) * A^T
+        # Paper: xi(µ + σEi) = xiµ + σ * (xiBi) * A^T_i
+        # For rank=1: xiBi is batched vector-vector dot product (scalars)
+        # Then batched scalar-vector multiplication with A^T_i
+        
+        # Reshape for batched matmul: [pop, batch*seq, in_features]
+        orig_shape = x.shape
+        x_flat = x.reshape(pop_size, -1, in_features)
+        
+        # xiBi: batched vector-vector dot product to get scalars (inexpensive per paper)
+        # x_flat: [pop, batch*seq, in_features]
+        # B_chunk: [pop, in_features]
+        # Use bmm for efficient batched matrix-vector multiplication
+        # Result: [pop, batch*seq] (scalars per position)
+        xB = torch.bmm(x_flat, B_chunk.unsqueeze(-1)).squeeze(-1)
+        
+        # (xiBi) * A^T_i: batched scalar-vector multiplication
+        # xB: [pop, batch*seq] (scalars)
+        # A_chunk: [pop, out_features] (A^T_i when viewed as row vector)
+        # Result: [pop, batch*seq, out_features]
+        # Broadcast: [pop, batch*seq, 1] * [pop, 1, out_features]
+        xBA = sigma * (xB.unsqueeze(-1) * A_chunk.unsqueeze(1))
+        
+        # Reshape back
+        y_pert = xBA.reshape(orig_shape[:-1] + (out_features,))
         
         y = y_base + y_pert
         
