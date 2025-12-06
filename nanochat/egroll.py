@@ -17,91 +17,37 @@ import torch
 import hashlib
 
 
-def generate_lowrank_noise_factors(param_shape, seed, device='cpu'):
+# Cache for parameter -> name mapping (computed once per model)
+_param_name_cache = {}
+
+def get_parameter_name(param, model):
     """
-    Generate low-rank noise factors (A, B) using deterministic seed.
+    Get the parameter name from a parameter object by looking it up in the model.
     
-    For parameter W with shape (m, n):
-    - Returns A ∈ R^m, B ∈ R^n (rank=1 vectors)
-    - Perturbation is E = sigma * A @ B.T (sigma=1.0 implicit, absorbed into lr)
-    - Uses per-call Generator for thread-safety and performance
-    
-    CRITICAL: Uses torch.Generator (NOT global torch.manual_seed):
-    - No global RNG state pollution
-    - Thread-safe and distributed-safe
-    - Much faster (no RNG state save/restore overhead)
-    
-    NOTE: For production with large populations, use vectorized chunk-level
-    generation directly in _linear_batched_lowrank (generates batches of A, B).
-    This helper is provided for reference and distributed ES updates.
+    This avoids brittle string construction and ensures consistency between
+    forward pass and ES update. Uses caching to avoid repeated lookups.
     
     Args:
-        param_shape: (m, n) shape of parameter (e.g., [out_features, in_features])
-        seed: Deterministic seed for this specific perturbation
-        device: torch device
+        param: Parameter tensor (e.g., block.attn.c_q.weight)
+        model: Model containing the parameter
     
     Returns:
-        A, B: Low-rank factors (vectors when rank=1)
+        Full parameter name (e.g., "transformer.h.0.attn.c_q.weight")
     """
-    m, n = param_shape
+    # Use parameter object id as cache key (faster than tensor comparison)
+    param_id = id(param)
     
-    # Create per-call generator (thread-safe, no global state)
-    gen = torch.Generator(device=device)
-    gen.manual_seed(seed)
+    # Check cache first
+    if param_id in _param_name_cache:
+        return _param_name_cache[param_id]
     
-    # Generate factors with i.i.d. N(0,1) entries (rank=1: vectors, not matrices)
-    A = torch.randn(m, generator=gen, device=device)
-    B = torch.randn(n, generator=gen, device=device)
+    # Look up parameter name
+    for name, p in model.named_parameters():
+        if p is param:
+            _param_name_cache[param_id] = name
+            return name
     
-    return A, B
-
-
-def generate_fullrank_noise(param_shape, seed, device='cpu'):
-    """
-    Generate full-rank noise for 1D parameters (bias, LayerNorm).
-    Uses per-call Generator for thread-safety and performance.
-    """
-    # Create per-call generator (thread-safe, no global state)
-    gen = torch.Generator(device=device)
-    gen.manual_seed(seed)
-    
-    noise = torch.randn(param_shape, generator=gen, device=device)
-    
-    return noise
-
-
-def normalize_layer_name(name):
-    """
-    Normalize parameter name to match forward pass layer naming convention.
-    
-    Forward pass uses names like:
-    - "transformer.wte" (embedding)
-    - "h.0.attn.c_q" (attention layers)
-    
-    named_parameters() returns:
-    - "transformer.wte.weight" (embedding)
-    - "transformer.h.0.attn.c_q.weight" (attention layers)
-    
-    This function strips suffixes and adjusts prefixes to ensure consistent naming.
-    
-    Args:
-        name: Full parameter name (e.g., "transformer.h.0.attn.c_q.weight")
-    
-    Returns:
-        Normalized name matching forward pass convention
-    """
-    # Remove ".weight" or ".bias" suffix if present
-    if name.endswith(".weight"):
-        name = name[:-len(".weight")]
-    elif name.endswith(".bias"):
-        name = name[:-len(".bias")]
-    
-    # Special case: embedding layer keeps "transformer." prefix
-    # Other layers need "transformer.h" -> "h" conversion
-    if name.startswith("transformer.h."):
-        name = name[len("transformer."):]  # Remove "transformer." prefix
-    
-    return name
+    raise ValueError(f"Parameter not found in model. This should not happen.")
 
 
 def stable_hash_name(name):
@@ -156,7 +102,130 @@ def compute_perturbation_seed(base_seed, step, world_size, population_size, ddp_
 
 
 @torch.no_grad()
-def es_update_vectorized(model, fitnesses, seeds, lr, weight_decay=0.0, update_chunk_size=256):
+def _update_2d_parameter(p, seeds, local_norm_fit, layer_hash, chunk_size, device, N_local):
+    """
+    Update a 2D matrix parameter using low-rank (rank=1) ES update.
+    
+    Args:
+        p: Parameter tensor [m, n]
+        seeds: (N_local,) tensor of seeds
+        local_norm_fit: (N_local,) tensor of normalized fitnesses
+        layer_hash: Hash for this layer (computed from parameter name)
+        chunk_size: Chunk size for processing (seeds must be iterated in same order as evaluate_population)
+        device: Device for tensors
+        N_local: Local population size
+    
+    Returns:
+        update: [m, n] tensor of accumulated updates
+    """
+    m, n = p.shape
+    update = torch.zeros_like(p.data)
+    
+    # Process local population in chunks
+    for chunk_start in range(0, N_local, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, N_local)
+        chunk_size_actual = chunk_end - chunk_start
+        
+        # Get chunk of seeds and fitnesses
+        seeds_chunk = seeds[chunk_start:chunk_end]
+        norm_fit_chunk = local_norm_fit[chunk_start:chunk_end]
+        
+        # Generate noise for each member in chunk independently
+        # CRITICAL: Each member must have independent noise based on their own seed
+        A_chunk = torch.zeros(chunk_size_actual, m, device=device, dtype=p.dtype)
+        B_chunk = torch.zeros(chunk_size_actual, n, device=device, dtype=p.dtype)
+        
+        for i in range(chunk_size_actual):
+            member_seed = int(seeds_chunk[i].item()) + layer_hash
+            gen = torch.Generator(device=device)
+            gen.manual_seed(member_seed)
+            A_chunk[i] = torch.randn(m, generator=gen, device=device, dtype=p.dtype)
+            B_chunk[i] = torch.randn(n, generator=gen, device=device, dtype=p.dtype)
+        
+        # Scale A by fitness: [chunk_size, m]
+        # CRITICAL: Cast norm_fit to same dtype as noise to avoid einsum dtype mismatch
+        A_scaled = A_chunk * norm_fit_chunk.to(p.dtype).view(chunk_size_actual, 1)
+        
+        # Compute batched outer products and sum using einsum (rank=1 optimized)
+        # 'cm,cn->mn' is outer product: sum over chunk dimension
+        chunk_update = torch.einsum('cm,cn->mn', A_scaled, B_chunk)
+        update.add_(chunk_update)
+    
+    return update
+
+
+@torch.no_grad()
+def _update_embedding_parameter(p, seeds, local_norm_fit, layer_hash, chunk_size, device, N_local, idx):
+    """
+    Update embedding parameter using sparse updates based on token indices.
+    
+    Only updates rows corresponding to tokens used in the forward pass.
+    This ensures the ES invariant: noise used in forward pass matches noise used in update.
+    
+    Args:
+        p: Parameter tensor [vocab_size, n_embd]
+        seeds: (N_local,) tensor of seeds
+        local_norm_fit: (N_local,) tensor of normalized fitnesses
+        layer_hash: Hash for this layer (computed from parameter name)
+        chunk_size: Chunk size for processing (seeds must be iterated in same order as evaluate_population)
+        device: Device for tensors
+        N_local: Local population size
+        idx: [N_local, batch, seq] tensor of token indices
+    
+    Returns:
+        update: [vocab_size, n_embd] tensor of accumulated updates
+    """
+    m, n = p.shape
+    update = torch.zeros_like(p.data)
+    
+    # Process local population in chunks
+    for chunk_start in range(0, N_local, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, N_local)
+        chunk_size_actual = chunk_end - chunk_start
+        
+        # Get chunk of seeds and fitnesses
+        seeds_chunk = seeds[chunk_start:chunk_end]
+        norm_fit_chunk = local_norm_fit[chunk_start:chunk_end]
+        idx_chunk = idx[chunk_start:chunk_end]  # [chunk, batch, seq]
+        
+        # Generate noise for each member in chunk independently
+        # CRITICAL: Each member must have independent noise based on their own seed
+        A_chunk = torch.zeros(chunk_size_actual, m, device=device, dtype=p.dtype)
+        B_chunk = torch.zeros(chunk_size_actual, n, device=device, dtype=p.dtype)
+        
+        for i in range(chunk_size_actual):
+            member_seed = int(seeds_chunk[i].item()) + layer_hash
+            gen = torch.Generator(device=device)
+            gen.manual_seed(member_seed)
+            A_chunk[i] = torch.randn(m, generator=gen, device=device, dtype=p.dtype)
+            B_chunk[i] = torch.randn(n, generator=gen, device=device, dtype=p.dtype)
+        
+        # For each member in chunk, accumulate updates only for tokens used
+        for c in range(chunk_size_actual):
+            # Get tokens used by this member
+            member_tokens = idx_chunk[c].flatten()  # [batch*seq]
+            # Get A values for these tokens (matching forward pass)
+            A_indexed = A_chunk[c][member_tokens]  # [batch*seq]
+            # Scale by fitness
+            A_scaled = A_indexed * norm_fit_chunk[c].to(p.dtype)
+            # Compute outer product: A_indexed @ B^T for used tokens only
+            # A_scaled: [batch*seq], B_chunk[c]: [n_embd]
+            # Compute contribution: [batch*seq, n_embd]
+            contribution = A_scaled.unsqueeze(-1) * B_chunk[c]
+            # Sum contributions per unique token (handle duplicates)
+            # Use scatter_add to accumulate contributions for each token
+            unique_tokens, inverse_indices = torch.unique(member_tokens, return_inverse=True)
+            # Sum contributions for each unique token
+            token_contributions = torch.zeros(len(unique_tokens), n, device=device, dtype=p.dtype)
+            token_contributions.scatter_add_(0, inverse_indices.unsqueeze(-1).expand_as(contribution), contribution)
+            # Add to update
+            update[unique_tokens] += token_contributions
+    
+    return update
+
+
+@torch.no_grad()
+def es_update_vectorized(model, fitnesses, seeds, lr, weight_decay=0.0, chunk_size=256, idx=None):
     """
     ES update with vectorized chunked noise generation (rank=1 optimized).
     
@@ -167,22 +236,29 @@ def es_update_vectorized(model, fitnesses, seeds, lr, weight_decay=0.0, update_c
     
     Args:
         model: Model to update
-        fitnesses: (N,) tensor of fitness scores
-                   - Single-GPU: all fitnesses
-                   - Multi-GPU: fitnesses from this rank only (will be used after global normalization)
-        seeds: (N,) tensor of seeds corresponding to fitnesses
-               - Single-GPU: all seeds
-               - Multi-GPU: seeds from this rank only
+        fitnesses: (N_total,) tensor of fitness scores
+                   - Single-GPU: all fitnesses (N_total = population_size)
+                   - Multi-GPU: all fitnesses from all ranks (after all_gather)
+                                Caller must gather fitnesses using all_gather_into_tensor
+                                before calling this function
+        seeds: (N_local,) tensor of seeds corresponding to local population members
+               - Single-GPU: all seeds (N_local = population_size = N_total)
+               - Multi-GPU: seeds from this rank only (N_local = population_size // world_size)
+                            This function extracts the corresponding local_fitnesses slice
         lr: Learning rate (effective step size, sigma already fused into lr)
         weight_decay: Weight decay coefficient
-        update_chunk_size: Process this many members at once (balance speed and memory)
-                          CRITICAL: Must match chunk_size used in model.evaluate_population()
-                          to ensure noise consistency between forward and update!
+        chunk_size: Process this many members at once (balance speed and memory)
+                   Note: chunk_size does not need to match evaluate_population's chunk_size.
+                   As long as seeds are iterated in the same order, noise will be consistent.
+        idx: Optional input token indices [batch, seq] for embedding updates
+             Will be automatically broadcasted to [N_local, batch, seq]
+             Only needed for embedding layer updates (transformer.wte.weight)
     
-    Note: For multi-GPU, caller should pass all_fitnesses (after all_gather) for normalization,
-          but only local seeds. This function will extract the relevant local_fitnesses slice.
+    Note: For multi-GPU, caller must gather all fitnesses using all_gather_into_tensor
+          before calling this function. This ensures proper global normalization.
+          The function then extracts the local slice corresponding to local seeds.
     Note: rank=1 is hardcoded for optimization (1/sqrt(1)=1.0, vectors instead of matrices).
-    Note: sigma is fused into lr, so update formula is: W += (lr / N) * Σ fitness_i * A_i @ B_i^T
+    Note: sigma is fused into lr, so update formula is: W += (lr / N_total) * Σ fitness_i * A_i @ B_i^T
     """
     # Detect if we're in DDP mode
     import torch.distributed as dist
@@ -212,43 +288,30 @@ def es_update_vectorized(model, fitnesses, seeds, lr, weight_decay=0.0, update_c
     
     device = fitnesses.device
     
+    # Broadcast idx to add population dimension if needed
+    # _update_embedding_parameter expects idx: [N_local, batch, seq]
+    # Callers pass [batch, seq] from dataloader, which we broadcast
+    if idx is not None:
+        if idx.ndim == 2:
+            # Broadcast from [batch, seq] to [N_local, batch, seq]
+            idx = idx.unsqueeze(0).expand(N_local, -1, -1)
+        else:
+            raise ValueError(f"idx must be 2D [batch, seq], got {idx.ndim}D with shape {idx.shape}")
+    
     for name, p in model.named_parameters():
         if p.ndim == 2:  # Matrix parameters
-            # CRITICAL: Normalize name to match forward pass convention
-            normalized_name = normalize_layer_name(name)
-            layer_hash = stable_hash_name(normalized_name)
-            m, n = p.shape
-            update = torch.zeros_like(p.data)
+            layer_hash = stable_hash_name(name)
             
-            # Process local population in chunks
-            for chunk_start in range(0, N_local, update_chunk_size):
-                chunk_end = min(chunk_start + update_chunk_size, N_local)
-                chunk_size = chunk_end - chunk_start
-                
-                # Get chunk of seeds and fitnesses
-                seeds_chunk = seeds[chunk_start:chunk_end]
-                norm_fit_chunk = local_norm_fit[chunk_start:chunk_end]
-                
-                # VECTORIZED: Generate noise for entire chunk with ONE generator
-                # CRITICAL: Derive from first member's seed (same as forward pass)
-                chunk_seed = int(seeds_chunk[0].item()) + layer_hash
-                gen = torch.Generator(device=device)
-                gen.manual_seed(chunk_seed)
-                
-                # Two big randn calls instead of many small ones
-                # rank=1: [chunk_size, m] and [chunk_size, n] (vectors, not matrices)
-                # CRITICAL: Use same dtype as parameters to match forward pass noise generation
-                A_chunk = torch.randn(chunk_size, m, generator=gen, device=device, dtype=p.dtype)
-                B_chunk = torch.randn(chunk_size, n, generator=gen, device=device, dtype=p.dtype)
-                
-                # Scale A by fitness: [chunk_size, m]
-                # CRITICAL: Cast norm_fit to same dtype as noise to avoid einsum dtype mismatch
-                A_scaled = A_chunk * norm_fit_chunk.to(p.dtype).view(chunk_size, 1)
-                
-                # Compute batched outer products and sum using einsum (rank=1 optimized)
-                # 'cm,cn->mn' is outer product: sum over chunk dimension
-                chunk_update = torch.einsum('cm,cn->mn', A_scaled, B_chunk)
-                update.add_(chunk_update)
+            # Check if this is embedding layer and we have token indices
+            is_embedding = name == 'transformer.wte.weight'
+            if is_embedding and idx is not None:
+                update = _update_embedding_parameter(
+                    p, seeds, local_norm_fit, layer_hash, chunk_size, device, N_local, idx
+                )
+            else:
+                update = _update_2d_parameter(
+                    p, seeds, local_norm_fit, layer_hash, chunk_size, device, N_local
+                )
             
             # Multi-GPU: all-reduce to combine contributions from all ranks
             if is_distributed:
@@ -264,179 +327,3 @@ def es_update_vectorized(model, fitnesses, seeds, lr, weight_decay=0.0, update_c
             # Weight decay
             if weight_decay > 0:
                 p.data.mul_(1 - lr * weight_decay)
-        
-        elif p.ndim == 1:
-            # FOR PRETRAINING: Update 1D params
-            # FOR FINE-TUNING: Skip if frozen (uncomment continue below)
-            # continue
-            
-            # Vectorized full-rank update
-            # CRITICAL: Normalize name to match forward pass convention
-            normalized_name = normalize_layer_name(name)
-            layer_hash = stable_hash_name(normalized_name)
-            update = torch.zeros_like(p.data)
-            
-            for chunk_start in range(0, N_local, update_chunk_size):
-                chunk_end = min(chunk_start + update_chunk_size, N_local)
-                seeds_chunk = seeds[chunk_start:chunk_end]
-                norm_fit_chunk = local_norm_fit[chunk_start:chunk_end]
-                chunk_size_actual = chunk_end - chunk_start
-                
-                # CRITICAL: Derive chunk seed from first member (same as forward pass)
-                chunk_seed = int(seeds_chunk[0].item()) + layer_hash
-                gen = torch.Generator(device=device)
-                gen.manual_seed(chunk_seed)
-                # CRITICAL: Use same dtype as parameters to match forward pass noise generation
-                epsilon_chunk = torch.randn(chunk_size_actual, *p.shape, generator=gen, device=device, dtype=p.dtype)
-                
-                # CRITICAL: Cast norm_fit to same dtype to avoid type mismatch
-                weighted = epsilon_chunk * norm_fit_chunk.to(p.dtype).view(chunk_size_actual, *([1] * len(p.shape)))
-                update.add_(weighted.sum(dim=0))
-            
-            # Multi-GPU: all-reduce to combine contributions
-            if is_distributed:
-                dist.all_reduce(update, op=dist.ReduceOp.SUM)
-            
-            # Scale and apply update (use N_total for proper scaling)
-            # Update formula: W += (lr / N) * Σ fitness_i * epsilon_i
-            # Note: sigma is fused into lr, so no division by sigma here
-            scaling = lr / N_total
-            p.data.add_(update, alpha=scaling)
-            
-            if weight_decay > 0:
-                p.data.mul_(1 - lr * weight_decay)
-
-
-@torch.no_grad()
-def accumulate_micro_population_vectorized(model, fitnesses, seeds, sigma,
-                                          accumulated_updates, update_chunk_size=256):
-    """
-    Accumulate fitness-weighted perturbations using chunk-level RNG and batched operations.
-    
-    Used for temporal accumulation to achieve large effective population sizes.
-    Note: sigma is used to scale perturbations in forward pass, then normalized in es_update_with_accumulation.
-    Note: rank=1 is hardcoded for optimization.
-    
-    Args:
-        model: Model (not modified, used for parameter iteration)
-        fitnesses: (M,) tensor of fitness scores
-        seeds: (M,) tensor of seeds
-        sigma: Noise temperature (perturbation scale used in forward pass)
-        accumulated_updates: Dict to accumulate updates into
-        update_chunk_size: Process this many members at once
-    """
-    norm_fit = (fitnesses - fitnesses.mean()) / (fitnesses.std() + 1e-8)
-    M = len(fitnesses)
-    device = fitnesses.device
-    
-    for name, p in model.named_parameters():
-        if p.ndim == 2:
-            # CRITICAL: Normalize name to match forward pass convention
-            normalized_name = normalize_layer_name(name)
-            layer_hash = stable_hash_name(normalized_name)
-            m, n = p.shape
-            
-            if name not in accumulated_updates:
-                accumulated_updates[name] = torch.zeros_like(p.data)
-            
-            # Process in chunks
-            for chunk_start in range(0, M, update_chunk_size):
-                chunk_end = min(chunk_start + update_chunk_size, M)
-                chunk_size = chunk_end - chunk_start
-                
-                seeds_chunk = seeds[chunk_start:chunk_end]
-                norm_fit_chunk = norm_fit[chunk_start:chunk_end]
-                
-                # VECTORIZED: Generate noise for chunk with ONE generator
-                # CRITICAL: Derive from first member's seed (same as forward pass)
-                chunk_seed = int(seeds_chunk[0].item()) + layer_hash
-                gen = torch.Generator(device=device)
-                gen.manual_seed(chunk_seed)
-                
-                # Two big randn calls (rank=1: vectors, not matrices)
-                # CRITICAL: Use same dtype as parameters to match forward pass noise generation
-                A_chunk = torch.randn(chunk_size, m, generator=gen, device=device, dtype=p.dtype)
-                B_chunk = torch.randn(chunk_size, n, generator=gen, device=device, dtype=p.dtype)
-                # CRITICAL: Cast norm_fit to same dtype to avoid einsum dtype mismatch
-                A_scaled = A_chunk * norm_fit_chunk.to(p.dtype).view(chunk_size, 1)
-                
-                # Accumulate using einsum (rank=1 optimized)
-                chunk_update = torch.einsum('cm,cn->mn', A_scaled, B_chunk)
-                accumulated_updates[name].add_(chunk_update)
-        
-        elif p.ndim == 1:
-            # FOR PRETRAINING: Accumulate 1D params
-            # FOR FINE-TUNING: Skip if frozen
-            # continue
-            
-            # CRITICAL: Normalize name to match forward pass convention
-            normalized_name = normalize_layer_name(name)
-            layer_hash = stable_hash_name(normalized_name)
-            
-            if name not in accumulated_updates:
-                accumulated_updates[name] = torch.zeros_like(p.data)
-            
-            for chunk_start in range(0, M, update_chunk_size):
-                chunk_end = min(chunk_start + update_chunk_size, M)
-                chunk_size = chunk_end - chunk_start
-                
-                seeds_chunk = seeds[chunk_start:chunk_end]
-                norm_fit_chunk = norm_fit[chunk_start:chunk_end]
-                
-                chunk_seed = int(seeds_chunk[0].item()) + layer_hash
-                gen = torch.Generator(device=device)
-                gen.manual_seed(chunk_seed)
-                # CRITICAL: Use same dtype as parameters to match forward pass noise generation  
-                epsilon_chunk = torch.randn(chunk_size, *p.shape, generator=gen, device=device, dtype=p.dtype)
-                
-                # CRITICAL: Cast norm_fit to same dtype to avoid type mismatch
-                weighted = epsilon_chunk * norm_fit_chunk.to(p.dtype).view(chunk_size, *([1] * len(p.shape)))
-                accumulated_updates[name].add_(weighted.sum(dim=0))
-    
-    return accumulated_updates
-
-
-@torch.no_grad()
-def es_update_with_accumulation(model, accumulated_updates, N_total, sigma, lr, weight_decay=0.0):
-    """
-    Apply ES update after accumulating fitness-weighted perturbations across micro-populations.
-    
-    This is called ONCE after accumulating over K micro-populations.
-    
-    Args:
-        model: Model to update
-        accumulated_updates: Dict of accumulated fitness-weighted noise per parameter
-        N_total: Total effective population size (sum of all micro-population sizes)
-        sigma: Noise temperature (perturbation scale used in forward pass; not used in update scaling)
-        lr: Learning rate (effective step size, sigma already fused into lr)
-        weight_decay: Weight decay coefficient
-    Note: rank=1 is hardcoded for optimization.
-    Note: sigma is fused into lr, so update formula is: W += (lr / N) * accumulated_update
-    """
-    for name, p in model.named_parameters():
-        if p.ndim == 2 and name in accumulated_updates:
-            # Scale accumulated update by ES formula
-            # Update formula: W += (lr / N) * accumulated_update
-            # Note: sigma is fused into lr, so no division by sigma here
-            # rank=1: sqrt(1)=1.0, so no sqrt division needed
-            scaling = lr / N_total
-            p.data.add_(accumulated_updates[name], alpha=scaling)
-            
-            # Apply weight decay
-            if weight_decay > 0:
-                p.data.mul_(1 - lr * weight_decay)
-        
-        elif p.ndim == 1:
-            # FOR PRETRAINING: Update 1D params
-            # FOR FINE-TUNING: Skip if frozen
-            # continue
-            
-            if name in accumulated_updates:
-                # Update formula: W += (lr / N) * accumulated_update
-                # Note: sigma is fused into lr, so no division by sigma here
-                scaling = lr / N_total
-                p.data.add_(accumulated_updates[name], alpha=scaling)
-                
-                if weight_decay > 0:
-                    p.data.mul_(1 - lr * weight_decay)
-

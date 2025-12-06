@@ -109,7 +109,8 @@ def train_with_hyperparams(model, train_loader, val_loader, token_bytes, populat
             seeds,
             es_lr,
             weight_decay=0.0,
-            update_chunk_size=chunk_size
+            chunk_size=chunk_size,
+            idx=x
         )
         
         # Get next batch
@@ -173,7 +174,7 @@ def main():
     # Model architecture (from es_training.sh)
     depth = 32
     max_seq_len = 512
-    device_batch_size = 16
+    device_batch_size = 32
     
     # Derive model config (same as base_train.py)
     tokenizer = get_tokenizer()
@@ -228,10 +229,10 @@ def main():
     
     # Hyperparameter search space
     # More conservative ranges for the larger model
-    es_lr_values = [0.01, 0.05, 0.1, 0.2]
-    sigma_values = [0.1]  # Use 0.1 for bfloat16 (paper's 0.01 is too small for bf16)
-    population_sizes = [64, 256, 1024]
-    chunk_sizes = [2]  # Conservative chunk sizes for large model
+    es_lr_values = [0.05]
+    sigma_values = [0.1]
+    population_sizes = [64, 128, 512]
+    chunk_sizes = [1]  # Conservative chunk sizes for large model
     num_steps_values = [10]  # Fewer steps for faster search
     # rank=1 is hardcoded for optimization (removed es_rank parameter)
     base_seed = 42

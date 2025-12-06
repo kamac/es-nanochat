@@ -20,14 +20,22 @@ else
     TORCHRUN_CMD="uv run torchrun"  # Use uv to run torchrun
 fi
 
+# Wandb configuration (set to "dummy" to disable wandb logging)
+# To enable wandb, you need to authenticate first:
+#   1. Run: wandb login
+#   2. Or set: export WANDB_API_KEY=your_api_key_here
+# Get your API key from: https://wandb.ai/authorize
+WANDB_PROJECT=${WANDB_PROJECT:-"nanochat"}  # wandb project name
+WANDB_RUN_PREFIX=${WANDB_RUN_PREFIX:-"es_test"}  # prefix for wandb run names
+
 # Common training parameters (for 40gb vram)
 COMMON_ARGS="
     --depth=32
     --max_seq_len=512
     --device_batch_size=16
     --population_size=512
+    --sigma=0.1
     --es_lr=0.1
-    --es_rank=1
     --chunk_size=2
     --eval_every=10
     --core_metric_every=-1
@@ -61,7 +69,7 @@ echo "=========================================="
 echo ""
 
 $PYTHON_CMD -m scripts.base_train \
-    --run=es_test_single \
+    --run=${WANDB_RUN_PREFIX}_single \
     $COMMON_ARGS
 
 echo ""
@@ -76,7 +84,7 @@ if [ "$NUM_GPUS" -ge 2 ]; then
     echo ""
     
     $TORCHRUN_CMD --nproc_per_node=2 scripts/base_train.py \
-        --run=es_test_2gpu \
+        --run=${WANDB_RUN_PREFIX}_2gpu \
         $COMMON_ARGS
     
     echo ""
@@ -91,7 +99,7 @@ if [ "$NUM_GPUS" -ge 4 ]; then
     echo ""
     
     $TORCHRUN_CMD --nproc_per_node=4 scripts/base_train.py \
-        --run=es_test_4gpu \
+        --run=${WANDB_RUN_PREFIX}_4gpu \
         $COMMON_ARGS
     
     echo ""
@@ -105,8 +113,8 @@ if [ "$NUM_GPUS" -ge 8 ]; then
     echo "=========================================="
     echo ""
     
-    $TORCHRUN_CMD --nproc_per_node=8 scripts/base_train.py \
-        --run=es_test_8gpu \
+    $TORCHRUN_CMD --nproc_per_node=8 scripts.base_train.py \
+        --run=${WANDB_RUN_PREFIX}_8gpu \
         $COMMON_ARGS
     
     echo ""

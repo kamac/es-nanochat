@@ -364,15 +364,13 @@ while True:
     
     # Apply ES update (works for both single-GPU and multi-GPU automatically)
     # NOTE: This modifies parameters directly via param.data
-    # CRITICAL: update_chunk_size MUST EQUAL chunk_size from evaluate_population!
-    # This ensures RNG seed alignment between forward pass and parameter update.
-    # If these don't match, each fitness will be correlated with the WRONG noise,
-    # completely breaking the ES gradient estimator and causing "loss not going down" issues.
+    # Note: chunk_size does not need to match evaluate_population's chunk_size.
+    # As long as seeds are iterated in the same order, noise will be consistent.
     # For multi-GPU: pass all_fitnesses (global) and seeds (local), function handles the rest
     if step == 0 and master_process:
         print0(f"[Diagnostic] ES update: chunk_size={chunk_size}, len(seeds)={len(seeds)}, len(all_fitnesses)={len(all_fitnesses)}")
     es_update_vectorized(orig_model, all_fitnesses, seeds, current_lr, weight_decay, 
-                        update_chunk_size=chunk_size)
+                        chunk_size=chunk_size, idx=x)
     
     # For logging: estimate loss from average fitness
     # Use all_fitnesses for accurate global loss (includes all ranks)
