@@ -43,26 +43,36 @@ def compute_loss(model, x, y):
     return loss
 
 
-def train_with_hyperparams(model, train_loader, val_loader, token_bytes, population_size, sigma, es_lr, 
-                           chunk_size, num_steps, base_seed, device, device_type, 
+def train_with_hyperparams(model, build_val_loader, token_bytes, population_size, sigma, es_lr,
+                           chunk_size, num_steps, base_seed, device, device_type,
+                           device_batch_size, max_seq_len, eval_tokens,
                            eval_every=10, verbose=False):
     """
     Train model with given hyperparameters and return results.
-    
+    Uses same eval setup as base_train.py for accurate comparison.
+
     Returns:
         dict with keys: initial_loss, final_loss, loss_reduction, success, losses, val_losses
     """
     autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
-    
+
+    # Same eval_steps calculation as base_train.py
+    eval_steps = eval_tokens // (device_batch_size * max_seq_len)
+
     # Reset model to initial state (reinitialize weights)
     model.init_weights()
-    
-    # Initial loss on validation set
+
+    # Create fresh train loader for this run
+    train_loader = tokenizing_distributed_data_loader(
+        device_batch_size, max_seq_len, split="train", device=device
+    )
+
+    # Initial loss on validation set (same as base_train.py)
     model.eval()
+    val_loader = build_val_loader()
     with torch.inference_mode(), autocast_ctx:
-        # Evaluate on a few validation batches
-        val_bpb = evaluate_bpb(model, val_loader, 5, token_bytes)
-        initial_loss = val_bpb  # Use validation bpb as initial loss
+        val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+        initial_loss = val_bpb
     
     losses = []
     val_losses = []
@@ -108,6 +118,7 @@ def train_with_hyperparams(model, train_loader, val_loader, token_bytes, populat
             fitnesses,
             seeds,
             es_lr,
+            sigma,
             weight_decay=0.0,
             chunk_size=chunk_size,
             idx=x
@@ -121,22 +132,19 @@ def train_with_hyperparams(model, train_loader, val_loader, token_bytes, populat
         train_loss = -avg_fitness  # fitness = -loss
         losses.append(train_loss)
         
-        # Evaluate on validation set periodically
+        # Evaluate on validation set periodically (same as base_train.py)
         if step % eval_every == 0 or step == num_steps - 1:
             model.eval()
+            val_loader = build_val_loader()  # Fresh loader each time like base_train
             with torch.inference_mode(), autocast_ctx:
-                val_bpb = evaluate_bpb(model, val_loader, 5, token_bytes)
+                val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
                 val_losses.append((step, val_bpb))
-        
-        if verbose and (step % 20 == 0 or step == num_steps - 1):
+
+        if verbose and (step % eval_every == 0 or step == num_steps - 1):
             print(f"  Step {step:3d}: train_loss={train_loss:.6f}, val_bpb={val_bpb:.6f}")
-    
-    # Final validation loss
-    model.eval()
-    with torch.inference_mode(), autocast_ctx:
-        final_val_bpb = evaluate_bpb(model, val_loader, 5, token_bytes)
-    
-    final_loss = final_val_bpb
+
+    # Use last validation loss as final (we already evaluated at step num_steps-1)
+    final_loss = val_losses[-1][1] if val_losses else initial_loss
     loss_reduction = (initial_loss - final_loss) / initial_loss * 100
     success = final_loss < initial_loss * 0.97  # 3% reduction threshold
     
@@ -172,9 +180,9 @@ def main():
     print()
     
     # Model architecture (from es_training.sh)
-    depth = 32
-    max_seq_len = 512
-    device_batch_size = 32
+    depth = 8
+    max_seq_len = 256
+    device_batch_size = 4
     
     # Derive model config (same as base_train.py)
     tokenizer = get_tokenizer()
@@ -213,30 +221,33 @@ def main():
     print(f"  num_params: {num_params:,}")
     print()
     
-    # Create data loaders
-    train_loader = tokenizing_distributed_data_loader(
-        device_batch_size, max_seq_len, split="train", device=device
-    )
-    val_loader = tokenizing_distributed_data_loader(
+    # Eval settings (same as base_train.py defaults)
+    eval_tokens = 20 * 524288  # Same as base_train.py
+
+    # Build val loader factory (same pattern as base_train.py)
+    build_val_loader = lambda: tokenizing_distributed_data_loader(
         device_batch_size, max_seq_len, split="val", device=device
     )
-    
+
     # Get token_bytes for evaluation
     token_bytes = get_token_bytes(device=device)
-    
-    print(f"Data loaders initialized")
+
+    eval_steps = eval_tokens // (device_batch_size * max_seq_len)
+    print(f"Eval settings:")
+    print(f"  eval_tokens: {eval_tokens:,}")
+    print(f"  eval_steps: {eval_steps:,}")
     print()
     
     # Hyperparameter search space
-    # More conservative ranges for the larger model
-    es_lr_values = [0.05]
-    sigma_values = [0.1]
-    population_sizes = [64, 128, 512]
-    chunk_sizes = [1]  # Conservative chunk sizes for large model
-    num_steps_values = [10]  # Fewer steps for faster search
+    # Match es_training.sh defaults for baseline, then explore around it
+    es_lr_values = [0.0001, 0.001, 0.01]  # Smaller LRs since we fixed the 1/sigma scaling
+    sigma_values = [0.01, 0.05, 0.1]
+    population_sizes = [128]  # Match es_training.sh
+    chunk_sizes = [32]  # Match es_training.sh
+    num_steps_values = [20]  # Enough steps to see real learning
     # rank=1 is hardcoded for optimization (removed es_rank parameter)
     base_seed = 42
-    
+
     # LR scaling for population size (same as base_train.py)
     reference_population = 256  # Baseline population for es_lr tuning
     
@@ -272,7 +283,7 @@ def main():
                         
                         try:
                             result = train_with_hyperparams(
-                                model, train_loader, val_loader, token_bytes,
+                                model, build_val_loader, token_bytes,
                                 population_size=population_size,
                                 sigma=sigma,
                                 es_lr=es_lr_scaled,  # Use scaled LR
@@ -281,8 +292,11 @@ def main():
                                 base_seed=base_seed,
                                 device=device,
                                 device_type=device_type,
+                                device_batch_size=device_batch_size,
+                                max_seq_len=max_seq_len,
+                                eval_tokens=eval_tokens,
                                 eval_every=10,
-                                verbose=False
+                                verbose=True
                             )
                             
                             result['sigma'] = sigma
@@ -393,4 +407,3 @@ def main():
 if __name__ == "__main__":
     success = main()
     sys.exit(0 if success else 1)
-

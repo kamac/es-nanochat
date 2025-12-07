@@ -35,8 +35,8 @@ run = "dummy" # wandb run name default ("dummy" is special - we won't log to wan
 # Runtime
 device_type = "" # cuda|cpu|mps (empty => autodetect good device type default, in order: CUDA > MPS > CPU)
 # Model architecture
-depth = 20 # the depth of the Transformer model to train, rest of the kwargs are derived
-max_seq_len = 2048 # max context length
+depth = 32 # the depth of the Transformer model to train, rest of the kwargs are derived
+max_seq_len = 512 # max context length
 # Training horizon. Only one of these 3 will be used, in this order of precedence.
 num_iterations = -1 # explicit number of steps of the optimization (-1 = disable)
 target_flops = -1.0 # calculate num_iterations to reach target_flops. Useful for scaling laws experiments (-1 = disable)
@@ -44,13 +44,13 @@ target_param_data_ratio = 20 # calculate num_iterations to maintain fixed data:p
 # Optimization (EGGROLL - Evolution Strategies)
 device_batch_size = 32 # sequences per forward pass (set to not OOM)
 # ES hyperparameters
-population_size = 256 # ES population size per update (start small, scale up; paper uses 262144)
+population_size = 512 # ES population size per update (start small, scale up; paper uses 262144)
 sigma = 0.1 # Noise temperature (perturbation scale; use 0.1 for bfloat16, 0.01 for float32)
-es_lr = 0.02 # ES learning rate (effective step size)
+es_lr = 0.05 # ES learning rate (effective step size)
 # rank=1 is hardcoded for optimization (removed es_rank parameter)
 weight_decay = 0.0 # weight decay (applied as decoupled weight decay like AdamW)
 base_seed = 42 # base random seed for deterministic noise generation
-chunk_size = 8 # ES population chunk size (memory vs speed tradeoff; start conservative)
+chunk_size = 1 # ES population chunk size (memory vs speed tradeoff; start conservative)
 warmup_ratio = 0.0 # ratio of iterations for LR warmup
 warmdown_ratio = 0.2 # ratio of iterations for LR warmdown
 final_lr_frac = 0.0 # final LR is this fraction of the initial LR
@@ -148,11 +148,13 @@ if resuming:
         print0(f"WARNING: Resuming with different base_seed! Checkpoint: {meta_data['base_seed']}, Current: {base_seed}")
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+# NOTE: torch.compile disabled for ES training - compiled model may cache graphs that don't see param.data updates
+# model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 num_params = sum(p.numel() for p in model.parameters())
 print0(f"Number of parameters: {num_params:,}")
 num_flops_per_token = model.estimate_flops()
-print0(f"Estimated FLOPs per token: {num_flops_per_token:e}")
+num_flops_per_token = num_flops_per_token * population_size  # Account for ES population size
+print0(f"Estimated FLOPs per token (accounting for population size): {num_flops_per_token:e}")
 
 # Calculate number of iterations. Either it is given, or from target flops, or from target data:param ratio (in that order)
 assert num_iterations > 0 or target_param_data_ratio > 0 or target_flops > 0
@@ -160,6 +162,7 @@ if num_iterations > 0:
     print0(f"Using user-provided number of iterations (ES updates): {num_iterations:,}")
 elif target_flops > 0:
     # calculate the number of iterations from the target flops
+    # num_flops_per_token already accounts for population_size
     num_iterations = round(target_flops / (num_flops_per_token * tokens_per_batch))
     print0(f"Calculated number of ES updates from target FLOPs: {num_iterations:,}")
 elif target_param_data_ratio > 0:
@@ -228,8 +231,8 @@ else:
 # Training loop
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
-    # FLOPs calculation for ES: each step does population_size forward passes
-    flops_so_far = num_flops_per_token * tokens_per_batch * population_size * step
+    # FLOPs calculation for ES: num_flops_per_token already accounts for population_size
+    flops_so_far = num_flops_per_token * tokens_per_batch * step
 
     # once in a while: evaluate the val bpb (all ranks participate)
     if last_step or step % eval_every == 0:
@@ -369,8 +372,8 @@ while True:
     # For multi-GPU: pass all_fitnesses (global) and seeds (local), function handles the rest
     if step == 0 and master_process:
         print0(f"[Diagnostic] ES update: chunk_size={chunk_size}, len(seeds)={len(seeds)}, len(all_fitnesses)={len(all_fitnesses)}")
-    es_update_vectorized(orig_model, all_fitnesses, seeds, current_lr, weight_decay, 
-                        chunk_size=chunk_size, idx=x)
+    es_update_vectorized(orig_model, all_fitnesses, seeds, current_lr, sigma,
+                        weight_decay=weight_decay, chunk_size=chunk_size, idx=x)
     
     # For logging: estimate loss from average fitness
     # Use all_fitnesses for accurate global loss (includes all ranks)
@@ -405,7 +408,7 @@ while True:
     tok_per_sec = int(tokens_per_batch / dt)  # tokens per second (data throughput)
     # ES effective throughput: each forward pass is done population_size times
     es_evals_per_sec = population_size / dt  # population evaluations per second
-    flops_per_sec = num_flops_per_token * tokens_per_batch * population_size / dt  # total FLOPs including all population members
+    flops_per_sec = num_flops_per_token * tokens_per_batch / dt  # total FLOPs (num_flops_per_token already accounts for population_size)
     promised_flops_per_sec_h100 = 989e12 * ddp_world_size # bfloat16 H100 SXM and without 2:4 sparsity
     mfu = 100 * flops_per_sec / promised_flops_per_sec_h100 # in %
     if step > 10:

@@ -30,17 +30,18 @@ WANDB_RUN_PREFIX=${WANDB_RUN_PREFIX:-"es_test"}  # prefix for wandb run names
 
 # Common training parameters (for 40gb vram)
 COMMON_ARGS="
-    --depth=32
-    --max_seq_len=512
-    --device_batch_size=16
-    --population_size=512
-    --sigma=0.1
-    --es_lr=0.1
-    --chunk_size=2
+    --depth=4
+    --max_seq_len=128
+    --device_batch_size=4
+    --population_size=256
+    --sigma=0.01
+    --es_lr=0.0001
+    --chunk_size=16
     --eval_every=10
     --core_metric_every=-1
     --sample_every=100
     --save_every=-1
+    --num_iterations=86400
 "
 
 echo "=========================================="

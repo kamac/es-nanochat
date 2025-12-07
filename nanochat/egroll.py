@@ -225,15 +225,15 @@ def _update_embedding_parameter(p, seeds, local_norm_fit, layer_hash, chunk_size
 
 
 @torch.no_grad()
-def es_update_vectorized(model, fitnesses, seeds, lr, weight_decay=0.0, chunk_size=256, idx=None):
+def es_update_vectorized(model, fitnesses, seeds, lr, sigma, weight_decay=0.0, chunk_size=256, idx=None):
     """
     ES update with vectorized chunked noise generation (rank=1 optimized).
-    
+
     Works for both single-GPU and multi-GPU (DDP) training automatically.
     Detects DDP and uses all_reduce when needed.
-    
+
     Processes multiple members per chunk using batched ops for performance.
-    
+
     Args:
         model: Model to update
         fitnesses: (N_total,) tensor of fitness scores
@@ -245,7 +245,8 @@ def es_update_vectorized(model, fitnesses, seeds, lr, weight_decay=0.0, chunk_si
                - Single-GPU: all seeds (N_local = population_size = N_total)
                - Multi-GPU: seeds from this rank only (N_local = population_size // world_size)
                             This function extracts the corresponding local_fitnesses slice
-        lr: Learning rate (effective step size, sigma already fused into lr)
+        lr: Learning rate (effective step size)
+        sigma: Noise temperature (perturbation scale) - must match the sigma used in evaluate_population
         weight_decay: Weight decay coefficient
         chunk_size: Process this many members at once (balance speed and memory)
                    Note: chunk_size does not need to match evaluate_population's chunk_size.
@@ -253,12 +254,13 @@ def es_update_vectorized(model, fitnesses, seeds, lr, weight_decay=0.0, chunk_si
         idx: Optional input token indices [batch, seq] for embedding updates
              Will be automatically broadcasted to [N_local, batch, seq]
              Only needed for embedding layer updates (transformer.wte.weight)
-    
+
     Note: For multi-GPU, caller must gather all fitnesses using all_gather_into_tensor
           before calling this function. This ensures proper global normalization.
           The function then extracts the local slice corresponding to local seeds.
     Note: rank=1 is hardcoded for optimization (1/sqrt(1)=1.0, vectors instead of matrices).
-    Note: sigma is fused into lr, so update formula is: W += (lr / N_total) * Σ fitness_i * A_i @ B_i^T
+    Note: ES gradient formula: ∇J ≈ (1/nσ) Σ f_i · ε_i where ε_i is unit normal noise.
+          Update formula: W += (lr / (N_total * sigma)) * Σ fitness_i * A_i @ B_i^T
     """
     # Detect if we're in DDP mode
     import torch.distributed as dist
@@ -318,10 +320,10 @@ def es_update_vectorized(model, fitnesses, seeds, lr, weight_decay=0.0, chunk_si
                 dist.all_reduce(update, op=dist.ReduceOp.SUM)
             
             # Scale and apply update (use N_total for proper scaling)
-            # Update formula: W += (lr / N) * Σ fitness_i * A_i @ B_i^T
-            # Note: sigma is fused into lr, so no division by sigma here
+            # ES gradient: ∇J ≈ (1/Nσ) * Σ f_i * ε_i (score function trick introduces 1/σ)
+            # Update formula: W += (lr / (N * σ)) * Σ fitness_i * ε_i
             # rank=1: sqrt(1)=1.0, so no sqrt division needed
-            scaling = lr / N_total
+            scaling = lr / (N_total * sigma)
             p.data.add_(update, alpha=scaling)
             
             # Weight decay

@@ -205,7 +205,7 @@ class GPT(nn.Module):
         nparams = sum(p.numel() for p in self.parameters())
         nparams_embedding = self.transformer.wte.weight.numel()
         l, h, q, t = self.config.n_layer, self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
-        num_flops_per_token = 6 * (nparams - nparams_embedding) + 12 * l * h * q * t
+        num_flops_per_token = 2 * (nparams - nparams_embedding) + 6 * l * h * q * t
         return num_flops_per_token
 
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
