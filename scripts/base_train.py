@@ -35,14 +35,15 @@ run = "dummy" # wandb run name default ("dummy" is special - we won't log to wan
 # Runtime
 device_type = "" # cuda|cpu|mps (empty => autodetect good device type default, in order: CUDA > MPS > CPU)
 # Model architecture
-depth = 32 # the depth of the Transformer model to train, rest of the kwargs are derived
-max_seq_len = 512 # max context length
+depth = 20 # the depth of the Transformer model to train, rest of the kwargs are derived
+max_seq_len = 2048 # max context length
 # Training horizon. Only one of these 3 will be used, in this order of precedence.
 num_iterations = -1 # explicit number of steps of the optimization (-1 = disable)
 target_flops = -1.0 # calculate num_iterations to reach target_flops. Useful for scaling laws experiments (-1 = disable)
 target_param_data_ratio = 20 # calculate num_iterations to maintain fixed data:param ratio (Chinchilla=20) (-1 = disable)
 # Optimization (EGGROLL - Evolution Strategies)
 device_batch_size = 32 # sequences per forward pass (set to not OOM)
+total_batch_size = 524288 # total desired batch size, in #tokens (determines grad_accum_steps)
 # ES hyperparameters
 population_size = 512 # ES population size per update (start small, scale up; paper uses 262144)
 sigma = 0.1 # Noise temperature (perturbation scale; use 0.1 for bfloat16, 0.01 for float32)
@@ -61,7 +62,8 @@ eval_tokens = 20*524288 # number of tokens to evaluate val loss on
 core_metric_every = 2000 # every how many steps to evaluate the core metric (-1 = disable)
 core_metric_max_per_task = 500 # examples per task in estimating the core metric
 sample_every = 2000 # every how many steps to sample from the model
-save_every = -1 # every how many steps to save model checkpoints (-1 = disable, and save only at the end of the run)
+save_every = -1 # every how many steps to save model checkpoints (-1 = only at end of run)
+test_mode = False # disable sampling and checkpointing (for hyperparameter search)
 # Output
 model_tag = "" # optionally override the model tag for the output checkpoint directory name
 # now allow CLI to override the settings via the configurator lol
@@ -99,27 +101,21 @@ print0(f"num_heads: {num_heads}")
 print0(f"num_kv_heads: {num_kv_heads}")
 
 # ES training hyperparameters
-# Each ES update: population_size models evaluate the same batch, then parameters are updated once
-tokens_per_batch = device_batch_size * max_seq_len  # tokens per forward pass
-tokens_per_es_update = tokens_per_batch  # all population members see the same batch
-print0(f"Tokens per ES update: {device_batch_size} seqs × {max_seq_len} = {tokens_per_batch:,}")
+# Figure out the needed gradient accumulation to reach the desired total batch size
+tokens_per_fwdbwd = device_batch_size * max_seq_len  # tokens per iteration for a single rank
+world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size  # total tokens per iteration for all ranks
+assert total_batch_size % world_tokens_per_fwdbwd == 0, \
+    f"total_batch_size ({total_batch_size}) must be divisible by world_tokens_per_fwdbwd ({world_tokens_per_fwdbwd})"
+grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
+print0(f"Tokens / micro-batch / rank: {device_batch_size} x {max_seq_len} = {tokens_per_fwdbwd:,}")
+print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
+print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
+# Each ES update: population_size models evaluate grad_accum_steps batches each, then parameters are updated once
+tokens_per_es_update = total_batch_size  # total unique tokens per ES update
 print0(f"Population size: {population_size}")
-print0(f"ES evaluations per update: {population_size} models × {tokens_per_batch:,} tokens = {population_size * tokens_per_batch:,} total forward pass tokens")
+print0(f"ES evaluations per update: {population_size} policies × {grad_accum_steps} batches × {tokens_per_fwdbwd:,} tokens = {population_size * tokens_per_es_update:,} total forward pass tokens")
 
-# Automatic learning rate scaling for population size
-# The ES formula lr / (σ√r·N) has 1/N term, so larger populations reduce effective step size
-# We use SQRT scaling (not linear) because:
-# - Larger populations give better gradient estimates (can use larger steps)
-# - But linear scaling is too aggressive (causes divergence)
-# - Square root is a conservative middle ground
-reference_population = 256  # Baseline population for es_lr tuning
-es_lr_base = es_lr  # Store original for logging
-import math
-scaling_factor = math.sqrt(population_size / reference_population)
-es_lr = es_lr * scaling_factor
-print0(f"ES learning rate (base): {es_lr_base}")
-print0(f"ES learning rate (scaling factor): {scaling_factor:.4f} (sqrt scaling)")
-print0(f"ES learning rate (scaled for pop={population_size}): {es_lr:.6f}")
+print0(f"ES learning rate: {es_lr}")
 
 # -----------------------------------------------------------------------------
 # Initialize the Model
@@ -131,6 +127,16 @@ with torch.device("meta"):
     model = GPT(model_config)
 model.to_empty(device=device)
 model.init_weights()
+# ES training: disable gradients on all parameters (saves VRAM - no grad buffers allocated)
+model.requires_grad_(False)
+
+# Multi-GPU fix: Re-register rotary embeddings as buffers after init_weights()
+# init_weights() shadows the registered buffers with plain attributes, which breaks
+# multi-GPU setups because PyTorch doesn't track plain attributes for device movement.
+# Re-registering ensures they're properly tracked as buffers.
+if ddp:
+    model.register_buffer("cos", model.cos, persistent=False)
+    model.register_buffer("sin", model.sin, persistent=False)
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
@@ -148,13 +154,17 @@ if resuming:
         print0(f"WARNING: Resuming with different base_seed! Checkpoint: {meta_data['base_seed']}, Current: {base_seed}")
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-# NOTE: torch.compile disabled for ES training - compiled model may cache graphs that don't see param.data updates
-# model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+# Skip torch.compile for ES training - the batched population forward pass doesn't benefit much
+# and causes cross-device issues in multi-GPU setups
+if not ddp:
+    model = torch.compile(model, dynamic=False)
+else:
+    print0("Skipping torch.compile for multi-GPU ES training")
 num_params = sum(p.numel() for p in model.parameters())
 print0(f"Number of parameters: {num_params:,}")
 num_flops_per_token = model.estimate_flops()
 num_flops_per_token = num_flops_per_token * population_size  # Account for ES population size
-print0(f"Estimated FLOPs per token (accounting for population size): {num_flops_per_token:e}")
+print0(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 
 # Calculate number of iterations. Either it is given, or from target flops, or from target data:param ratio (in that order)
 assert num_iterations > 0 or target_param_data_ratio > 0 or target_flops > 0
@@ -162,21 +172,21 @@ if num_iterations > 0:
     print0(f"Using user-provided number of iterations (ES updates): {num_iterations:,}")
 elif target_flops > 0:
     # calculate the number of iterations from the target flops
-    # num_flops_per_token already accounts for population_size
-    num_iterations = round(target_flops / (num_flops_per_token * tokens_per_batch))
+    # num_flops_per_token already accounts for population_size and grad_accum_steps
+    num_iterations = round(target_flops / (num_flops_per_token * tokens_per_fwdbwd))
     print0(f"Calculated number of ES updates from target FLOPs: {num_iterations:,}")
 elif target_param_data_ratio > 0:
     # calculate the number of iterations from the target param data ratio
     target_tokens = target_param_data_ratio * num_params
-    num_iterations = target_tokens // tokens_per_batch
+    num_iterations = target_tokens // tokens_per_es_update
     print0(f"Calculated number of ES updates from target data:param ratio: {num_iterations:,}")
 else:
     raise ValueError("No training horizon specified")
-total_tokens = tokens_per_batch * num_iterations
+total_tokens = tokens_per_es_update * num_iterations
 print0(f"Total number of training tokens: {total_tokens:,}")
-print0(f"Tokens : Params ratio: {tokens_per_batch * num_iterations / num_params:.2f}") # Chinchilla is ~20
+print0(f"Tokens : Params ratio: {tokens_per_es_update * num_iterations / num_params:.2f}") # Chinchilla is ~20
 print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
-print0(f"Note: Each ES update requires {population_size} forward passes (one per population member)")
+print0(f"Note: Each ES update requires {population_size} / {chunk_size} × {grad_accum_steps} = {population_size / chunk_size * grad_accum_steps} forward passes")
 
 # -----------------------------------------------------------------------------
 # ES Training: No optimizer needed (ES is stateless, updates parameters directly)
@@ -185,7 +195,7 @@ assert population_size % ddp_world_size == 0, \
     f"population_size ({population_size}) must be divisible by ddp_world_size ({ddp_world_size})"
 print0(f"ES population size: {population_size} ({population_size // ddp_world_size} per rank)")
 print0(f"ES sigma (noise temperature): {sigma}")
-print0(f"ES learning rate: {es_lr} (auto-scaled from base {es_lr_base} for population {population_size})")
+print0(f"ES learning rate: {es_lr}")
 print0(f"ES low-rank dimension: 1 (hardcoded for optimization)")
 print0(f"ES chunk size: {chunk_size}")
 
@@ -231,8 +241,8 @@ else:
 # Training loop
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
-    # FLOPs calculation for ES: num_flops_per_token already accounts for population_size
-    flops_so_far = num_flops_per_token * tokens_per_batch * step
+    # FLOPs calculation for ES: num_flops_per_token already accounts for population_size and grad_accum_steps
+    flops_so_far = num_flops_per_token * tokens_per_fwdbwd * step
 
     # once in a while: evaluate the val bpb (all ranks participate)
     if last_step or step % eval_every == 0:
@@ -270,7 +280,7 @@ while True:
 
     # once in a while: sample from the model (only on master process)
     # use the original uncompiled model because the inputs keep changing shape
-    if master_process and (last_step or (step > 0 and step % sample_every == 0)):
+    if not test_mode and master_process and (last_step or (step > 0 and step % sample_every == 0)):
         model.eval()
         prompts = [
             "The capital of France is",
@@ -290,7 +300,7 @@ while True:
         model.train()
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
-    if last_step or (step > 0 and step != resume_from_step and save_every > 0 and step % save_every == 0):
+    if not test_mode and (last_step or (step > 0 and step != resume_from_step and save_every > 0 and step % save_every == 0)):
         save_checkpoint(
             checkpoint_dir,
             step,
@@ -323,27 +333,46 @@ while True:
     # CRITICAL: Model in eval mode (disables dropout, ES provides exploration)
     model.eval()
     orig_model.eval()
-    
+
     synchronize()
     t0 = time.time()
-    
-    # CRITICAL: Use inference_mode to prevent gradient computation (saves VRAM)
-    with torch.inference_mode(), autocast_ctx:
-        # Evaluate population on current batch
-        # All population members evaluate the SAME batch (x, y)
-        # Returns LOCAL fitness scores and seeds (NOT full perturbations)
-        # In distributed: each rank evaluates population_size // world_size members
-        fitnesses, seeds = model.evaluate_population(
-            x, y,
-            population_size=population_size,
-            sigma=sigma,
-            base_seed=base_seed,
-            step=step,  # Unique seed per ES update
-            world_size=ddp_world_size,
-            ddp_rank=ddp_rank,
-            chunk_size=chunk_size
-        )
-    
+
+    # Accumulate fitnesses over grad_accum_steps batches (like gradient accumulation)
+    # Each policy (same seed/perturbation) is evaluated on multiple batches
+    accumulated_fitnesses = None
+    seeds = None
+
+    for micro_step in range(grad_accum_steps):
+        # CRITICAL: Use inference_mode to prevent gradient computation (saves VRAM)
+        with torch.inference_mode(), autocast_ctx:
+            # Evaluate population on current batch
+            # All population members evaluate the SAME batch (x, y)
+            # Returns LOCAL fitness scores and seeds (NOT full perturbations)
+            # In distributed: each rank evaluates population_size // world_size members
+            micro_fitnesses, micro_seeds = model.evaluate_population(
+                x, y,
+                population_size=population_size,
+                sigma=sigma,
+                base_seed=base_seed,
+                step=step,  # Unique seed per ES update (same across micro_steps!)
+                world_size=ddp_world_size,
+                ddp_rank=ddp_rank,
+                chunk_size=chunk_size
+            )
+
+        # Accumulate fitnesses (same policy across different batches)
+        if accumulated_fitnesses is None:
+            accumulated_fitnesses = micro_fitnesses.clone()
+            seeds = micro_seeds  # Seeds are the same across micro_steps
+        else:
+            accumulated_fitnesses += micro_fitnesses
+
+        # Fetch next batch for next micro_step (or next ES update if last)
+        x, y, dataloader_state_dict = next(train_loader)
+
+    # Average fitnesses over grad_accum_steps
+    fitnesses = accumulated_fitnesses / grad_accum_steps
+
     # Synchronize fitnesses across all ranks (DDP only)
     # All ranks need full fitness distribution for proper normalization
     if ddp:
@@ -371,30 +400,17 @@ while True:
     # As long as seeds are iterated in the same order, noise will be consistent.
     # For multi-GPU: pass all_fitnesses (global) and seeds (local), function handles the rest
     if step == 0 and master_process:
-        print0(f"[Diagnostic] ES update: chunk_size={chunk_size}, len(seeds)={len(seeds)}, len(all_fitnesses)={len(all_fitnesses)}")
+        print0(f"[Diagnostic] ES update: chunk_size={chunk_size}, len(seeds)={len(seeds)}, len(all_fitnesses)={len(all_fitnesses)}, grad_accum_steps={grad_accum_steps}")
     es_update_vectorized(orig_model, all_fitnesses, seeds, current_lr, sigma,
-                        weight_decay=weight_decay, chunk_size=chunk_size, idx=x)
-    
+                        weight_decay=weight_decay, chunk_size=chunk_size)
+
     # For logging: estimate loss from average fitness
     # Use all_fitnesses for accurate global loss (includes all ranks)
     avg_fitness = all_fitnesses.mean().item()
     train_loss = -avg_fitness  # fitness = -loss
-    
-    # Diagnostic: Check if population has variation (critical for ES!)
-    if step < 5:  # Only log first few steps
-        fitness_std = all_fitnesses.std().item()
-        fitness_range = (all_fitnesses.max() - all_fitnesses.min()).item()
-        if master_process:
-            print0(f"  [Diagnostic] Fitness std={fitness_std:.6f}, range={fitness_range:.6f}, unique_losses={len(torch.unique(-all_fitnesses))}")
-            if fitness_std < 1e-6:
-                print0(f"  [WARNING] No fitness variation! All population members identical!")
-                print0(f"  [WARNING] ES cannot learn. Check: sigma too small? perturbations not applied?")
-            elif fitness_std < 0.01:
-                print0(f"  [WARNING] Very small fitness variation. Consider increasing sigma.")
-    
-    # Prefetch next batch for next ES update
-    x, y, dataloader_state_dict = next(train_loader)
-    
+
+    # Note: next batch already fetched at end of grad_accum loop
+
     synchronize()
     t1 = time.time()
     dt = t1 - t0
@@ -405,17 +421,17 @@ while True:
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss # EMA the training loss
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
     pct_done = 100 * step / num_iterations
-    tok_per_sec = int(tokens_per_batch / dt)  # tokens per second (data throughput)
-    # ES effective throughput: each forward pass is done population_size times
-    es_evals_per_sec = population_size / dt  # population evaluations per second
-    flops_per_sec = num_flops_per_token * tokens_per_batch / dt  # total FLOPs (num_flops_per_token already accounts for population_size)
+    tok_per_sec = int(tokens_per_es_update / dt)  # tokens per second (data throughput, accounts for grad_accum)
+    # ES effective throughput: each forward pass is done population_size * grad_accum_steps times
+    es_evals_per_sec = (population_size * grad_accum_steps) / dt  # population evaluations per second
+    flops_per_sec = num_flops_per_token * tokens_per_fwdbwd / dt  # total FLOPs (num_flops_per_token already accounts for population_size and grad_accum)
     promised_flops_per_sec_h100 = 989e12 * ddp_world_size # bfloat16 H100 SXM and without 2:4 sparsity
     mfu = 100 * flops_per_sec / promised_flops_per_sec_h100 # in %
     if step > 10:
         total_training_time += dt # only count the time after the first 10 steps
     # ES training: no gradient norm to log
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | pop_eval/sec: {es_evals_per_sec:.1f} | mfu: {mfu:.2f} | total time: {total_training_time/60:.2f}m")
-    if step % 100 == 0:
+    if step % 10 == 0:
         log_data = {
             "step": step,
             "total_training_flops": flops_so_far,
@@ -445,14 +461,12 @@ get_report().log(section="Base model training", data=[
         "Number of FLOPs per token": f"{num_flops_per_token:e}",
         "ES population size": population_size,
         "ES sigma (noise temperature)": sigma,
-        "ES learning rate (base)": es_lr_base,
-        "ES learning rate (scaled)": es_lr,
-        "ES LR scaling factor": scaling_factor,
-        "ES LR scaling method": "sqrt",
+        "ES learning rate": es_lr,
         "ES rank": 1,
+        "ES grad_accum_steps": grad_accum_steps,
         "Calculated number of ES updates": num_iterations,
         "Number of training tokens (data consumed)": total_tokens,
-        "Tokens : Params ratio": tokens_per_batch * num_iterations / num_params,
+        "Tokens : Params ratio": tokens_per_es_update * num_iterations / num_params,
         "DDP world size": ddp_world_size,
         "warmup_ratio": warmup_ratio,
         "warmdown_ratio": warmdown_ratio,

@@ -1,12 +1,20 @@
 #!/bin/bash
-# ES Training Test Script
-# Tests both single-GPU and multi-GPU (distributed) training
+# ES Training Script
+# Automatically uses all available GPUs
 
 set -e  # Exit on error
 
-# Disable NVSHMEM (not needed for ES training)
+# Add project root to PYTHONPATH for torchrun compatibility
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
+
+# Disable NVSHMEM and peer GPU memory access (not needed for ES training)
+# ES training doesn't need GPU-to-GPU peer memory access since each rank
+# evaluates its own population subset independently
 export TORCH_NCCL_NVSHMEM_ENABLE=0
 export NCCL_NVSHMEM_DISABLE=1
+export NCCL_P2P_DISABLE=1  # Disable peer-to-peer memory access over NVLink
+export CUDA_VISIBLE_DEVICES_PEER_ACCESS_ENABLED=0  # Disable CUDA peer access
 
 # Detect if running on Google Colab
 if [ -d "/content" ] && ([ -d "/content/sample_data" ] || python3 -c "import google.colab" 2>/dev/null); then
@@ -28,20 +36,20 @@ fi
 WANDB_PROJECT=${WANDB_PROJECT:-"nanochat"}  # wandb project name
 WANDB_RUN_PREFIX=${WANDB_RUN_PREFIX:-"es_test"}  # prefix for wandb run names
 
-# Common training parameters (for 40gb vram)
+# Common training parameters (for 90gb vram)
 COMMON_ARGS="
     --depth=4
-    --max_seq_len=128
-    --device_batch_size=4
-    --population_size=256
+    --max_seq_len=256
+    --total_batch_size=32768
+    --device_batch_size=16
+    --population_size=4096
     --sigma=0.01
-    --es_lr=0.0001
+    --es_lr=0.01
     --chunk_size=16
-    --eval_every=10
+    --eval_every=50
     --core_metric_every=-1
     --sample_every=100
-    --save_every=-1
-    --num_iterations=86400
+    --save_every=100
 "
 
 echo "=========================================="
@@ -63,84 +71,20 @@ if [ "$NUM_GPUS" -eq 0 ]; then
     fi
 fi
 
-echo ""
-echo "=========================================="
-echo "Test 1: Single-GPU Training"
-echo "=========================================="
+echo "Using $NUM_GPUS GPU(s)"
 echo ""
 
-$PYTHON_CMD -m scripts.base_train \
-    --run=${WANDB_RUN_PREFIX}_single \
-    $COMMON_ARGS
-
-echo ""
-echo "✅ Single-GPU test completed"
-echo ""
-
-# Run distributed test if multiple GPUs available
-if [ "$NUM_GPUS" -ge 2 ]; then
-    echo "=========================================="
-    echo "Test 2: Multi-GPU Training (2 GPUs)"
-    echo "=========================================="
-    echo ""
-    
-    $TORCHRUN_CMD --nproc_per_node=2 scripts/base_train.py \
-        --run=${WANDB_RUN_PREFIX}_2gpu \
+if [ "$NUM_GPUS" -eq 1 ]; then
+    # Single GPU - use python directly
+    $PYTHON_CMD -m scripts.base_train \
+        --run=${WANDB_RUN_PREFIX} \
         $COMMON_ARGS
-    
-    echo ""
-    echo "✅ 2-GPU test completed"
-    echo ""
-fi
-
-if [ "$NUM_GPUS" -ge 4 ]; then
-    echo "=========================================="
-    echo "Test 3: Multi-GPU Training (4 GPUs)"
-    echo "=========================================="
-    echo ""
-    
-    $TORCHRUN_CMD --nproc_per_node=4 scripts/base_train.py \
-        --run=${WANDB_RUN_PREFIX}_4gpu \
+else
+    # Multiple GPUs - use torchrun
+    $TORCHRUN_CMD --nproc_per_node=$NUM_GPUS scripts/base_train.py \
+        --run=${WANDB_RUN_PREFIX} \
         $COMMON_ARGS
-    
-    echo ""
-    echo "✅ 4-GPU test completed"
-    echo ""
 fi
 
-if [ "$NUM_GPUS" -ge 8 ]; then
-    echo "=========================================="
-    echo "Test 4: Multi-GPU Training (8 GPUs)"
-    echo "=========================================="
-    echo ""
-    
-    $TORCHRUN_CMD --nproc_per_node=8 scripts.base_train.py \
-        --run=${WANDB_RUN_PREFIX}_8gpu \
-        $COMMON_ARGS
-    
-    echo ""
-    echo "✅ 8-GPU test completed"
-    echo ""
-fi
-
-echo "=========================================="
-echo "All Tests Passed! ✅"
-echo "=========================================="
 echo ""
-echo "Summary:"
-echo "  - Single-GPU: ✅"
-if [ "$NUM_GPUS" -ge 2 ]; then
-    echo "  - 2-GPU: ✅"
-fi
-if [ "$NUM_GPUS" -ge 4 ]; then
-    echo "  - 4-GPU: ✅"
-fi
-if [ "$NUM_GPUS" -ge 8 ]; then
-    echo "  - 8-GPU: ✅"
-fi
-echo ""
-echo "To run specific GPU count, use:"
-echo "  NUM_GPUS=1 ./test_es_training.sh  # Single-GPU only"
-echo "  NUM_GPUS=2 ./test_es_training.sh  # Up to 2 GPUs"
-echo "  NUM_GPUS=4 ./test_es_training.sh  # Up to 4 GPUs"
-echo "  NUM_GPUS=8 ./test_es_training.sh  # Up to 8 GPUs"
+echo "Training completed"

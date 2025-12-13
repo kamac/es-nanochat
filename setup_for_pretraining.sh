@@ -34,7 +34,7 @@ echo ""
 
 # Default intermediate artifacts directory
 export OMP_NUM_THREADS=1
-export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat}"
+export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-/workspace/cache}"
 mkdir -p "$NANOCHAT_BASE_DIR"
 echo "✓ Base directory: $NANOCHAT_BASE_DIR"
 
@@ -53,6 +53,7 @@ else
     curl -LsSf https://astral.sh/uv/install.sh | sh
     # Source the path for current session
     export PATH="$HOME/.cargo/bin:$PATH"
+    source $HOME/.local/bin/env
 fi
 
 # Detect if running on Google Colab
@@ -77,8 +78,8 @@ else
 
     echo "Creating virtual environment with system site-packages..."
     # Use system site-packages to access system PyTorch (avoids NVSHMEM issues)
-    # Must use same Python version as system (3.12) to access system packages
-    uv venv --python /usr/bin/python3.12 --system-site-packages
+    # Must use same Python version as system to access system packages
+    uv venv --python python3 --system-site-packages
 
     # Install the repo dependencies (will use system torch, install other deps)
     echo "Installing dependencies..."

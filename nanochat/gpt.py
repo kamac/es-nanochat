@@ -340,38 +340,36 @@ class GPT(nn.Module):
         # Allocate output fitnesses for LOCAL population only
         fitnesses = torch.empty(population_per_rank, device=device)
         
-        # CRITICAL: Process LOCAL population in chunks to avoid OOM
-        # Never materialize [pop, B, T, vocab] at once!
         for chunk_start in range(0, population_per_rank, chunk_size):
             chunk_end = min(chunk_start + chunk_size, population_per_rank)
             chunk_pop_size = chunk_end - chunk_start
-            
+
             # Get seeds for this chunk
             seeds_chunk = seeds[chunk_start:chunk_end]
-            
+
             # Expand inputs to [chunk_size, batch_size, seq_len]
             idx_chunk = idx.unsqueeze(0).expand(chunk_pop_size, -1, -1)
             targets_chunk = targets.unsqueeze(0).expand(chunk_pop_size, -1, -1)
-            
+
             # Forward pass with batched perturbations for this chunk only
             # Shape: [chunk_size, batch_size, seq_len, vocab_size]
             logits_chunk = self._forward_batched_population(idx_chunk, seeds_chunk, sigma)
-            
+
             # Compute loss for each population member in chunk
             # Reshape: [chunk * batch * seq, vocab] and [chunk * batch * seq]
             logits_flat = logits_chunk.reshape(-1, logits_chunk.size(-1))
             targets_flat = targets_chunk.reshape(-1)
-            
+
             # Compute CE loss
             loss_flat = F.cross_entropy(logits_flat, targets_flat, reduction='none', ignore_index=-1)
             # Reshape back: [chunk, batch, seq]
             loss_per_token = loss_flat.reshape(chunk_pop_size, batch_size, seq_len)
             # Average over batch and sequence: [chunk]
             loss_per_member = loss_per_token.mean(dim=[1, 2])
-            
+
             # Fitness = negative loss
             fitnesses[chunk_start:chunk_end] = -loss_per_member
-            
+
             # Chunk tensors will be freed here, keeping memory bounded
         
         return fitnesses, seeds
@@ -567,12 +565,8 @@ class GPT(nn.Module):
         
         # Apply causal mask (broadcasts over population dimension)
         # Mask shape: [1, 1, 1, seq, seq] -> broadcasts to [pop, batch, n_head, seq, seq]
-        if not hasattr(self, '_causal_mask_cache') or self._causal_mask_cache.size(-1) < seq_len:
-            mask = torch.tril(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool))
-            mask = mask.view(1, 1, 1, seq_len, seq_len)
-            self._causal_mask_cache = mask
-        
-        causal_mask = self._causal_mask_cache[:, :, :, :seq_len, :seq_len]
+        causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool))
+        causal_mask = causal_mask.view(1, 1, 1, seq_len, seq_len)
         att = att.masked_fill(~causal_mask, float('-inf'))
         
         # Softmax (applies per population member independently)

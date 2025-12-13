@@ -155,77 +155,7 @@ def _update_2d_parameter(p, seeds, local_norm_fit, layer_hash, chunk_size, devic
 
 
 @torch.no_grad()
-def _update_embedding_parameter(p, seeds, local_norm_fit, layer_hash, chunk_size, device, N_local, idx):
-    """
-    Update embedding parameter using sparse updates based on token indices.
-    
-    Only updates rows corresponding to tokens used in the forward pass.
-    This ensures the ES invariant: noise used in forward pass matches noise used in update.
-    
-    Args:
-        p: Parameter tensor [vocab_size, n_embd]
-        seeds: (N_local,) tensor of seeds
-        local_norm_fit: (N_local,) tensor of normalized fitnesses
-        layer_hash: Hash for this layer (computed from parameter name)
-        chunk_size: Chunk size for processing (seeds must be iterated in same order as evaluate_population)
-        device: Device for tensors
-        N_local: Local population size
-        idx: [N_local, batch, seq] tensor of token indices
-    
-    Returns:
-        update: [vocab_size, n_embd] tensor of accumulated updates
-    """
-    m, n = p.shape
-    update = torch.zeros_like(p.data)
-    
-    # Process local population in chunks
-    for chunk_start in range(0, N_local, chunk_size):
-        chunk_end = min(chunk_start + chunk_size, N_local)
-        chunk_size_actual = chunk_end - chunk_start
-        
-        # Get chunk of seeds and fitnesses
-        seeds_chunk = seeds[chunk_start:chunk_end]
-        norm_fit_chunk = local_norm_fit[chunk_start:chunk_end]
-        idx_chunk = idx[chunk_start:chunk_end]  # [chunk, batch, seq]
-        
-        # Generate noise for each member in chunk independently
-        # CRITICAL: Each member must have independent noise based on their own seed
-        A_chunk = torch.zeros(chunk_size_actual, m, device=device, dtype=p.dtype)
-        B_chunk = torch.zeros(chunk_size_actual, n, device=device, dtype=p.dtype)
-        
-        for i in range(chunk_size_actual):
-            member_seed = int(seeds_chunk[i].item()) + layer_hash
-            gen = torch.Generator(device=device)
-            gen.manual_seed(member_seed)
-            A_chunk[i] = torch.randn(m, generator=gen, device=device, dtype=p.dtype)
-            B_chunk[i] = torch.randn(n, generator=gen, device=device, dtype=p.dtype)
-        
-        # For each member in chunk, accumulate updates only for tokens used
-        for c in range(chunk_size_actual):
-            # Get tokens used by this member
-            member_tokens = idx_chunk[c].flatten()  # [batch*seq]
-            # Get A values for these tokens (matching forward pass)
-            A_indexed = A_chunk[c][member_tokens]  # [batch*seq]
-            # Scale by fitness
-            A_scaled = A_indexed * norm_fit_chunk[c].to(p.dtype)
-            # Compute outer product: A_indexed @ B^T for used tokens only
-            # A_scaled: [batch*seq], B_chunk[c]: [n_embd]
-            # Compute contribution: [batch*seq, n_embd]
-            contribution = A_scaled.unsqueeze(-1) * B_chunk[c]
-            # Sum contributions per unique token (handle duplicates)
-            # Use scatter_add to accumulate contributions for each token
-            unique_tokens, inverse_indices = torch.unique(member_tokens, return_inverse=True)
-            # Sum contributions for each unique token
-            token_contributions = torch.zeros(len(unique_tokens), n, device=device, dtype=p.dtype)
-            token_contributions.scatter_add_(0, inverse_indices.unsqueeze(-1).expand_as(contribution), contribution)
-            # Add to update
-            update[unique_tokens] += token_contributions
-    
-    return update
-
-
-@torch.no_grad()
-def es_update_vectorized(model, fitnesses, seeds, lr, sigma, weight_decay=0.0, chunk_size=256, idx=None):
+def es_update_vectorized(model, fitnesses, seeds, lr, sigma, weight_decay=0.0, chunk_size=256):
     """
     ES update with vectorized chunked noise generation (rank=1 optimized).
 
@@ -251,9 +181,6 @@ def es_update_vectorized(model, fitnesses, seeds, lr, sigma, weight_decay=0.0, c
         chunk_size: Process this many members at once (balance speed and memory)
                    Note: chunk_size does not need to match evaluate_population's chunk_size.
                    As long as seeds are iterated in the same order, noise will be consistent.
-        idx: Optional input token indices [batch, seq] for embedding updates
-             Will be automatically broadcasted to [N_local, batch, seq]
-             Only needed for embedding layer updates (transformer.wte.weight)
 
     Note: For multi-GPU, caller must gather all fitnesses using all_gather_into_tensor
           before calling this function. This ensures proper global normalization.
@@ -261,6 +188,8 @@ def es_update_vectorized(model, fitnesses, seeds, lr, sigma, weight_decay=0.0, c
     Note: rank=1 is hardcoded for optimization (1/sqrt(1)=1.0, vectors instead of matrices).
     Note: ES gradient formula: ∇J ≈ (1/nσ) Σ f_i · ε_i where ε_i is unit normal noise.
           Update formula: W += (lr / (N_total * sigma)) * Σ fitness_i * A_i @ B_i^T
+    Note: Embeddings are updated densely (all rows) rather than sparsely. With typical
+          batch sizes (500k+ tokens), nearly all vocab tokens are seen anyway.
     """
     # Detect if we're in DDP mode
     import torch.distributed as dist
@@ -289,31 +218,13 @@ def es_update_vectorized(model, fitnesses, seeds, lr, sigma, weight_decay=0.0, c
         local_norm_fit = norm_fit
     
     device = fitnesses.device
-    
-    # Broadcast idx to add population dimension if needed
-    # _update_embedding_parameter expects idx: [N_local, batch, seq]
-    # Callers pass [batch, seq] from dataloader, which we broadcast
-    if idx is not None:
-        if idx.ndim == 2:
-            # Broadcast from [batch, seq] to [N_local, batch, seq]
-            idx = idx.unsqueeze(0).expand(N_local, -1, -1)
-        else:
-            raise ValueError(f"idx must be 2D [batch, seq], got {idx.ndim}D with shape {idx.shape}")
-    
+
     for name, p in model.named_parameters():
-        if p.ndim == 2:  # Matrix parameters
+        if p.ndim == 2:  # Matrix parameters (including embeddings)
             layer_hash = stable_hash_name(name)
-            
-            # Check if this is embedding layer and we have token indices
-            is_embedding = name == 'transformer.wte.weight'
-            if is_embedding and idx is not None:
-                update = _update_embedding_parameter(
-                    p, seeds, local_norm_fit, layer_hash, chunk_size, device, N_local, idx
-                )
-            else:
-                update = _update_2d_parameter(
-                    p, seeds, local_norm_fit, layer_hash, chunk_size, device, N_local
-                )
+            update = _update_2d_parameter(
+                p, seeds, local_norm_fit, layer_hash, chunk_size, device, N_local
+            )
             
             # Multi-GPU: all-reduce to combine contributions from all ranks
             if is_distributed:

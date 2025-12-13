@@ -1,339 +1,192 @@
 """
 ES Hyperparameter Search Script
 
-Performs hyperparameter search for ES training on the actual target model architecture.
-Similar to tests/test_es_simple.py but uses:
-- Real model architecture (depth=32, max_seq_len=512, etc.)
-- Real data loader (not synthetic)
-- More realistic hyperparameter ranges
+Performs hyperparameter search by running base_train.py with different configs.
+Each trial runs a limited number of steps and we compare initial vs final val BPB.
 
 Run with:
     python -m scripts.es_hyperparameter_search
 """
 
 import os
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-import time
 import sys
+import re
+import subprocess
 import math
-from contextlib import nullcontext
-
-import torch
-
-from nanochat.gpt import GPT, GPTConfig
-from nanochat.dataloader import tokenizing_distributed_data_loader
-from nanochat.common import compute_init, compute_cleanup, print0, autodetect_device_type
-from nanochat.tokenizer import get_tokenizer, get_token_bytes
-from nanochat.loss_eval import evaluate_bpb
-from nanochat.egroll import es_update_vectorized
 
 
-def compute_loss(model, x, y):
-    """Compute cross-entropy loss"""
-    logits = model(x)
-    # Flatten for loss computation
-    logits_flat = logits.view(-1, logits.size(-1))
-    targets_flat = y.view(-1)
-    
-    loss = torch.nn.functional.cross_entropy(
-        logits_flat,
-        targets_flat,
-        reduction='mean'
-    )
-    return loss
-
-
-def train_with_hyperparams(model, build_val_loader, token_bytes, population_size, sigma, es_lr,
-                           chunk_size, num_steps, base_seed, device, device_type,
-                           device_batch_size, max_seq_len, eval_tokens,
-                           eval_every=10, verbose=False):
+def run_trial(population_size, sigma, es_lr, chunk_size, num_steps,
+              depth=8, max_seq_len=256, device_batch_size=4, total_batch_size=1024,
+              eval_every=10, verbose=False):
     """
-    Train model with given hyperparameters and return results.
-    Uses same eval setup as base_train.py for accurate comparison.
+    Run a single trial using base_train.py as subprocess.
 
     Returns:
-        dict with keys: initial_loss, final_loss, loss_reduction, success, losses, val_losses
+        dict with keys: initial_bpb, final_bpb, bpb_reduction, success, error
     """
-    autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
+    # Build command line args
+    cmd = [
+        sys.executable, "-m", "scripts.base_train",
+        f"--depth={depth}",
+        f"--max_seq_len={max_seq_len}",
+        f"--device_batch_size={device_batch_size}",
+        f"--total_batch_size={total_batch_size}",
+        f"--num_iterations={num_steps}",
+        f"--population_size={population_size}",
+        f"--sigma={sigma}",
+        f"--es_lr={es_lr}",
+        f"--chunk_size={chunk_size}",
+        f"--eval_every={eval_every}",
+        f"--eval_tokens={5*524288}",  # Smaller eval for faster trials
+        "--core_metric_every=-1",  # Disable core metric
+        "--test_mode=True",  # Disable sampling and checkpointing
+        "--run=dummy",  # No wandb
+    ]
 
-    # Same eval_steps calculation as base_train.py
-    eval_steps = eval_tokens // (device_batch_size * max_seq_len)
+    if verbose:
+        print(f"  Running: {' '.join(cmd[-10:])}")  # Show last 10 args for brevity
 
-    # Reset model to initial state (reinitialize weights)
-    model.init_weights()
-
-    # Create fresh train loader for this run
-    train_loader = tokenizing_distributed_data_loader(
-        device_batch_size, max_seq_len, split="train", device=device
-    )
-
-    # Initial loss on validation set (same as base_train.py)
-    model.eval()
-    val_loader = build_val_loader()
-    with torch.inference_mode(), autocast_ctx:
-        val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-        initial_loss = val_bpb
-    
-    losses = []
-    val_losses = []
-    
-    # Get first training batch
-    x, y = next(train_loader)
-    
-    for step in range(num_steps):
-        model.eval()
-        
-        # Evaluate population
-        with torch.inference_mode(), autocast_ctx:
-            fitnesses, seeds = model.evaluate_population(
-                x, y,
-                population_size=population_size,
-                sigma=sigma,
-                base_seed=base_seed,
-                step=step,
-                world_size=1,
-                ddp_rank=0,
-                chunk_size=chunk_size
-            )
-        
-        # Check fitness variation (critical for ES)
-        if step == 0:
-            fitness_std = fitnesses.std().item()
-            if fitness_std < 1e-6:
-                if verbose:
-                    print("ERROR: No fitness variation!")
-                return {
-                    'initial_loss': initial_loss,
-                    'final_loss': initial_loss,
-                    'loss_reduction': 0.0,
-                    'success': False,
-                    'losses': [initial_loss] * num_steps,
-                    'val_losses': [initial_loss] * num_steps,
-                    'error': 'no_fitness_variation'
-                }
-        
-        # Apply ES update
-        es_update_vectorized(
-            model,
-            fitnesses,
-            seeds,
-            es_lr,
-            sigma,
-            weight_decay=0.0,
-            chunk_size=chunk_size,
-            idx=x
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=None,  # No timeout
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         )
-        
-        # Get next batch
-        x, y = next(train_loader)
-        
-        # Compute current loss on training batch (from average fitness)
-        avg_fitness = fitnesses.mean().item()
-        train_loss = -avg_fitness  # fitness = -loss
-        losses.append(train_loss)
-        
-        # Evaluate on validation set periodically (same as base_train.py)
-        if step % eval_every == 0 or step == num_steps - 1:
-            model.eval()
-            val_loader = build_val_loader()  # Fresh loader each time like base_train
-            with torch.inference_mode(), autocast_ctx:
-                val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-                val_losses.append((step, val_bpb))
+        output = result.stdout + result.stderr
 
-        if verbose and (step % eval_every == 0 or step == num_steps - 1):
-            print(f"  Step {step:3d}: train_loss={train_loss:.6f}, val_bpb={val_bpb:.6f}")
+        if verbose:
+            # Print last few lines of output
+            lines = output.strip().split('\n')
+            for line in lines[-20:]:
+                print(f"    {line}")
 
-    # Use last validation loss as final (we already evaluated at step num_steps-1)
-    final_loss = val_losses[-1][1] if val_losses else initial_loss
-    loss_reduction = (initial_loss - final_loss) / initial_loss * 100
-    success = final_loss < initial_loss * 0.97  # 3% reduction threshold
-    
-    return {
-        'initial_loss': initial_loss,
-        'final_loss': final_loss,
-        'loss_reduction': loss_reduction,
-        'success': success,
-        'losses': losses,
-        'val_losses': val_losses
-    }
+        # Parse validation BPB values from output
+        # Format: "Step 00000 | Validation bpb: 12.3456"
+        bpb_pattern = r"Step (\d+) \| Validation bpb: ([\d.]+)"
+        matches = re.findall(bpb_pattern, output)
+
+        if not matches:
+            return {
+                'initial_bpb': float('inf'),
+                'final_bpb': float('inf'),
+                'bpb_reduction': -100.0,
+                'success': False,
+                'error': f'No validation BPB found in output. Return code: {result.returncode}'
+            }
+
+        # First match is initial (step 0), last match is final
+        initial_bpb = float(matches[0][1])
+        final_bpb = float(matches[-1][1])
+        bpb_reduction = (initial_bpb - final_bpb) / initial_bpb * 100
+
+        # Success if we reduced BPB by at least 1%
+        success = final_bpb < initial_bpb * 0.99
+
+        return {
+            'initial_bpb': initial_bpb,
+            'final_bpb': final_bpb,
+            'bpb_reduction': bpb_reduction,
+            'success': success,
+            'error': None
+        }
+
+    except Exception as e:
+        return {
+            'initial_bpb': float('inf'),
+            'final_bpb': float('inf'),
+            'bpb_reduction': -100.0,
+            'success': False,
+            'error': str(e)
+        }
 
 
 def main():
     """Main hyperparameter search function"""
-    
+
     print("="*60)
-    print("ES Hyperparameter Search (Target Model Architecture)")
+    print("ES Hyperparameter Search (via base_train.py)")
     print("="*60)
     print()
-    
-    # Setup
-    device_type = autodetect_device_type()
-    ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
-    master_process = ddp_rank == 0
-    
-    if ddp_world_size > 1:
-        print("ERROR: This script only supports single-GPU training")
-        print("Please run without torchrun")
-        sys.exit(1)
-    
-    print(f"Device: {device_type}")
-    print()
-    
-    # Model architecture (from es_training.sh)
-    depth = 8
+
+    # Model settings (small for fast trials)
+    depth = 4
     max_seq_len = 256
-    device_batch_size = 4
-    
-    # Derive model config (same as base_train.py)
-    tokenizer = get_tokenizer()
-    vocab_size = tokenizer.get_vocab_size()
-    num_layers = depth
-    model_dim = depth * 64  # aspect ratio 64
-    num_heads = max(1, (model_dim + 127) // 128)  # head dim 128
-    num_kv_heads = num_heads  # 1:1 GQA ratio
-    
+    device_batch_size = 16
+    total_batch_size = 8192
+
+    # Hyperparameter search space
+    es_lr_values = [0.01, 0.15, 0.02]
+    sigma_values = [0.01, 0.02, 0.05]
+    population_sizes = [16]
+    chunk_sizes = [16]
+    num_steps_values = [10]
+    eval_every = 5  # Eval at start, middle, and end
+
     print(f"Model config:")
     print(f"  depth: {depth}")
     print(f"  max_seq_len: {max_seq_len}")
     print(f"  device_batch_size: {device_batch_size}")
-    print(f"  vocab_size: {vocab_size:,}")
-    print(f"  num_layers: {num_layers}")
-    print(f"  model_dim: {model_dim}")
-    print(f"  num_heads: {num_heads}")
-    print(f"  num_kv_heads: {num_kv_heads}")
-    
-    # Create model
-    model_config = GPTConfig(
-        sequence_len=max_seq_len,
-        vocab_size=vocab_size,
-        n_layer=num_layers,
-        n_head=num_heads,
-        n_kv_head=num_kv_heads,
-        n_embd=model_dim
-    )
-    
-    with torch.device("meta"):
-        model = GPT(model_config)
-    model.to_empty(device=device)
-    model.init_weights()
-    
-    num_params = sum(p.numel() for p in model.parameters())
-    print(f"  num_params: {num_params:,}")
+    print(f"  total_batch_size: {total_batch_size}")
     print()
-    
-    # Eval settings (same as base_train.py defaults)
-    eval_tokens = 20 * 524288  # Same as base_train.py
 
-    # Build val loader factory (same pattern as base_train.py)
-    build_val_loader = lambda: tokenizing_distributed_data_loader(
-        device_batch_size, max_seq_len, split="val", device=device
-    )
-
-    # Get token_bytes for evaluation
-    token_bytes = get_token_bytes(device=device)
-
-    eval_steps = eval_tokens // (device_batch_size * max_seq_len)
-    print(f"Eval settings:")
-    print(f"  eval_tokens: {eval_tokens:,}")
-    print(f"  eval_steps: {eval_steps:,}")
-    print()
-    
-    # Hyperparameter search space
-    # Match es_training.sh defaults for baseline, then explore around it
-    es_lr_values = [0.0001, 0.001, 0.01]  # Smaller LRs since we fixed the 1/sigma scaling
-    sigma_values = [0.01, 0.05, 0.1]
-    population_sizes = [128]  # Match es_training.sh
-    chunk_sizes = [32]  # Match es_training.sh
-    num_steps_values = [20]  # Enough steps to see real learning
-    # rank=1 is hardcoded for optimization (removed es_rank parameter)
-    base_seed = 42
-
-    # LR scaling for population size (same as base_train.py)
-    reference_population = 256  # Baseline population for es_lr tuning
-    
     print("Hyperparameter Search:")
     print(f"  sigma: {sigma_values}")
-    print(f"  es_lr (base): {es_lr_values}")
+    print(f"  es_lr: {es_lr_values}")
     print(f"  population_size: {population_sizes}")
     print(f"  chunk_size: {chunk_sizes}")
     print(f"  num_steps: {num_steps_values}")
-    print(f"  rank: 1 (hardcoded for optimization)")
-    print(f"  reference_population: {reference_population} (for LR scaling)")
-    print(f"  Note: es_lr will be scaled by sqrt(pop/{reference_population})")
+    print(f"  eval_every: {eval_every}")
     print()
     print("Searching...")
     print("-" * 60)
-    
+
     results = []
-    
+
     for sigma in sigma_values:
-        for es_lr_base in es_lr_values:
+        for es_lr in es_lr_values:
             for population_size in population_sizes:
                 for chunk_size in chunk_sizes:
                     for num_steps in num_steps_values:
-                        # Ensure chunk_size doesn't exceed population_size
                         actual_chunk_size = min(chunk_size, population_size)
-                        
-                        # Apply sqrt scaling to learning rate based on population size
-                        scaling_factor = math.sqrt(population_size / reference_population)
-                        es_lr_scaled = es_lr_base * scaling_factor
-                        
-                        print(f"\nTesting: sigma={sigma:.3f}, es_lr_base={es_lr_base:.3f}, population_size={population_size}, chunk_size={actual_chunk_size}, num_steps={num_steps}")
-                        print(f"  → es_lr_scaled={es_lr_scaled:.6f} (scaling_factor={scaling_factor:.4f})")
-                        
-                        try:
-                            result = train_with_hyperparams(
-                                model, build_val_loader, token_bytes,
-                                population_size=population_size,
-                                sigma=sigma,
-                                es_lr=es_lr_scaled,  # Use scaled LR
-                                chunk_size=actual_chunk_size,
-                                num_steps=num_steps,
-                                base_seed=base_seed,
-                                device=device,
-                                device_type=device_type,
-                                device_batch_size=device_batch_size,
-                                max_seq_len=max_seq_len,
-                                eval_tokens=eval_tokens,
-                                eval_every=10,
-                                verbose=True
-                            )
-                            
-                            result['sigma'] = sigma
-                            result['es_lr_base'] = es_lr_base  # Store base LR for reporting
-                            result['es_lr_scaled'] = es_lr_scaled  # Store scaled LR
-                            result['scaling_factor'] = scaling_factor
-                            result['population_size'] = population_size
-                            result['chunk_size'] = actual_chunk_size
-                            result['num_steps'] = num_steps
-                            results.append(result)
-                        
+
+                        print(f"\nTesting: sigma={sigma:.3f}, es_lr={es_lr:.4f}, pop={population_size}, chunk={actual_chunk_size}, steps={num_steps}")
+
+                        result = run_trial(
+                            population_size=population_size,
+                            sigma=sigma,
+                            es_lr=es_lr,
+                            chunk_size=actual_chunk_size,
+                            num_steps=num_steps,
+                            depth=depth,
+                            max_seq_len=max_seq_len,
+                            device_batch_size=device_batch_size,
+                            total_batch_size=total_batch_size,
+                            eval_every=eval_every,
+                            verbose=True
+                        )
+
+                        result['sigma'] = sigma
+                        result['es_lr'] = es_lr
+                        result['population_size'] = population_size
+                        result['chunk_size'] = actual_chunk_size
+                        result['num_steps'] = num_steps
+                        results.append(result)
+
+                        if result['error']:
+                            print(f"  ❌ ERROR: {result['error']}")
+                        else:
                             status = "✅ PASS" if result['success'] else "❌ FAIL"
-                            print(f"  {status} | Initial: {result['initial_loss']:.4f} → Final: {result['final_loss']:.4f} | Reduction: {result['loss_reduction']:.2f}%")
-                        except Exception as e:
-                            print(f"  ❌ ERROR: {e}")
-                            results.append({
-                                'sigma': sigma,
-                                'es_lr_base': es_lr_base,
-                                'es_lr_scaled': es_lr_scaled,
-                                'scaling_factor': scaling_factor,
-                                'population_size': population_size,
-                                'chunk_size': actual_chunk_size,
-                                'num_steps': num_steps,
-                                'initial_loss': float('inf'),
-                                'final_loss': float('inf'),
-                                'loss_reduction': -100.0,
-                                'success': False,
-                                'error': str(e)
-                            })
-    
+                            print(f"  {status} | Initial: {result['initial_bpb']:.4f} → Final: {result['final_bpb']:.4f} | Reduction: {result['bpb_reduction']:.2f}%")
+
     print("-" * 60)
     print()
-    
+
     # Analyze results
     successful_configs = [r for r in results if r.get('success', False)]
-    all_reductions = [r['loss_reduction'] for r in results if 'loss_reduction' in r]
-    
+    all_reductions = [r['bpb_reduction'] for r in results if r.get('error') is None]
+
     print("="*60)
     print("Search Results Summary")
     print("="*60)
@@ -343,64 +196,57 @@ def main():
     if results:
         print(f"Success rate: {100 * len(successful_configs) / len(results):.1f}%")
     print()
-    
+
     if successful_configs:
         # Find best configuration
-        best = max(successful_configs, key=lambda r: r['loss_reduction'])
-        
+        best = max(successful_configs, key=lambda r: r['bpb_reduction'])
+
         print("✅ Best Configuration:")
         print(f"  sigma: {best['sigma']:.3f}")
-        print(f"  es_lr_base: {best['es_lr_base']:.3f}")
-        print(f"  es_lr_scaled: {best['es_lr_scaled']:.6f} (scaling_factor={best['scaling_factor']:.4f})")
+        print(f"  es_lr: {best['es_lr']:.4f}")
         print(f"  population_size: {best['population_size']}")
         print(f"  chunk_size: {best['chunk_size']}")
         print(f"  num_steps: {best['num_steps']}")
-        print(f"  Initial loss: {best['initial_loss']:.6f}")
-        print(f"  Final loss: {best['final_loss']:.6f}")
-        print(f"  Loss reduction: {best['loss_reduction']:.2f}%")
+        print(f"  Initial BPB: {best['initial_bpb']:.6f}")
+        print(f"  Final BPB: {best['final_bpb']:.6f}")
+        print(f"  BPB reduction: {best['bpb_reduction']:.2f}%")
         print()
-        
+
         # Show top 5
-        top5 = sorted(successful_configs, key=lambda r: r['loss_reduction'], reverse=True)[:5]
+        top5 = sorted(successful_configs, key=lambda r: r['bpb_reduction'], reverse=True)[:5]
         print("Top 5 Configurations:")
         for i, r in enumerate(top5, 1):
-            print(f"  {i}. sigma={r['sigma']:.3f}, lr_base={r['es_lr_base']:.3f}, pop={r['population_size']}, chunk={r['chunk_size']}, steps={r['num_steps']}, reduction={r['loss_reduction']:.2f}%")
+            print(f"  {i}. sigma={r['sigma']:.3f}, lr={r['es_lr']:.4f}, pop={r['population_size']}, reduction={r['bpb_reduction']:.2f}%")
         print()
-        
-        # Overall test passes if at least one config succeeded
+
         overall_success = True
         print("✅ SEARCH COMPLETE: At least one hyperparameter configuration succeeded!")
     else:
         print("❌ SEARCH FAILED: No hyperparameter configuration succeeded")
         print()
         if results:
-            print("Best attempt:")
-            best_attempt = max(results, key=lambda r: r.get('loss_reduction', -100))
-            print(f"  sigma: {best_attempt.get('sigma', 'N/A')}")
-            print(f"  es_lr_base: {best_attempt['es_lr_base']:.3f}")
-            print(f"  es_lr_scaled: {best_attempt['es_lr_scaled']:.6f} (scaling_factor={best_attempt['scaling_factor']:.4f})")
-            print(f"  population_size: {best_attempt['population_size']}")
-            print(f"  chunk_size: {best_attempt['chunk_size']}")
-            print(f"  num_steps: {best_attempt['num_steps']}")
-            print(f"  Loss reduction: {best_attempt.get('loss_reduction', -100):.2f}%")
-            if 'error' in best_attempt:
-                print(f"  Error: {best_attempt['error']}")
-            print()
+            # Find best attempt even if it failed
+            valid_results = [r for r in results if r.get('error') is None]
+            if valid_results:
+                best_attempt = max(valid_results, key=lambda r: r.get('bpb_reduction', -100))
+                print("Best attempt:")
+                print(f"  sigma: {best_attempt.get('sigma', 'N/A')}")
+                print(f"  es_lr: {best_attempt.get('es_lr', 'N/A')}")
+                print(f"  population_size: {best_attempt['population_size']}")
+                print(f"  BPB reduction: {best_attempt.get('bpb_reduction', -100):.2f}%")
+                print()
         overall_success = False
-    
+
     # Show distribution of results
     if all_reductions:
-        print("Loss Reduction Statistics:")
+        print("BPB Reduction Statistics:")
         print(f"  Mean: {sum(all_reductions) / len(all_reductions):.2f}%")
         print(f"  Min: {min(all_reductions):.2f}%")
         print(f"  Max: {max(all_reductions):.2f}%")
         print()
-    
+
     print("="*60)
-    
-    # Cleanup
-    compute_cleanup()
-    
+
     return overall_success
 
 
