@@ -1,3 +1,9 @@
+# Fork info
+
+Implementation of Evolution Strategies at Hyperscale (https://arxiv.org/abs/2511.16652) for nanochat. Blog post with details: https://mkozik.vercel.app/blog/training-nanochat-with-evolution-strategies
+
+Implementation is in this PR, so you can diff the changes: https://github.com/kamac/es-nanochat/pull/1
+
 # nanochat
 
 ![nanochat logo](dev/nanochat.png)
