@@ -12,16 +12,13 @@ Notable features:
 """
 
 import math
-from functools import partial
 from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from nanochat.common import get_dist_info, print0
-from nanochat.muon import Muon, DistMuon
-from nanochat.adamw import DistAdamW
+from nanochat.common import print0
 
 @dataclass
 class GPTConfig:
@@ -39,12 +36,13 @@ def norm(x):
 
 
 def apply_rotary_emb(x, cos, sin):
-    assert x.ndim == 4  # multihead attention
-    d = x.shape[3] // 2
-    x1, x2 = x[..., :d], x[..., d:] # split up last time into two halves
+    # Handle both 4D [batch, n_head, seq, head_dim] and 5D [pop, batch, seq, n_head, head_dim]
+    assert x.ndim in [4, 5], f"Expected 4D or 5D tensor, got {x.ndim}D"
+    d = x.shape[-1] // 2
+    x1, x2 = x[..., :d], x[..., d:] # split up last dim into two halves
     y1 = x1 * cos + x2 * sin # rotate pairs of dims
     y2 = x1 * (-sin) + x2 * cos
-    out = torch.cat([y1, y2], 3) # re-assemble
+    out = torch.cat([y1, y2], dim=-1) # re-assemble on last dimension
     out = out.to(x.dtype) # ensure input/output dtypes match
     return out
 
@@ -207,39 +205,8 @@ class GPT(nn.Module):
         nparams = sum(p.numel() for p in self.parameters())
         nparams_embedding = self.transformer.wte.weight.numel()
         l, h, q, t = self.config.n_layer, self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
-        num_flops_per_token = 6 * (nparams - nparams_embedding) + 12 * l * h * q * t
+        num_flops_per_token = 2 * (nparams - nparams_embedding) + 6 * l * h * q * t
         return num_flops_per_token
-
-    def setup_optimizers(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0):
-        model_dim = self.config.n_embd
-        ddp, rank, local_rank, world_size = get_dist_info()
-        # Separate out all parameters into 3 groups (matrix, embedding, lm_head)
-        matrix_params = list(self.transformer.h.parameters())
-        embedding_params = list(self.transformer.wte.parameters())
-        lm_head_params = list(self.lm_head.parameters())
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params)
-        # Create the AdamW optimizer for the embedding and lm_head
-        # Scale the LR for the AdamW parameters by ∝1/√dmodel (having tuned the LRs for 768 dim model)
-        dmodel_lr_scale = (model_dim / 768) ** -0.5
-        if rank == 0:
-            print(f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
-        adam_groups = [
-            dict(params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale),
-            dict(params=embedding_params, lr=embedding_lr * dmodel_lr_scale),
-        ]
-        adamw_kwargs = dict(betas=(0.8, 0.95), eps=1e-10, weight_decay=weight_decay)
-        AdamWFactory = DistAdamW if ddp else partial(torch.optim.AdamW, fused=True)
-        adamw_optimizer = AdamWFactory(adam_groups, **adamw_kwargs)
-        # Create the Muon optimizer for the linear layers
-        muon_kwargs = dict(lr=matrix_lr, momentum=0.95)
-        MuonFactory = DistMuon if ddp else Muon
-        muon_optimizer = MuonFactory(matrix_params, **muon_kwargs)
-        # Combine them the two optimizers into one list
-        optimizers = [adamw_optimizer, muon_optimizer]
-        for opt in optimizers:
-            for group in opt.param_groups:
-                group["initial_lr"] = group["lr"]
-        return optimizers
 
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
         B, T = idx.size()
@@ -305,3 +272,443 @@ class GPT(nn.Module):
             ids = torch.cat((ids, next_ids), dim=1)
             token = next_ids.item()
             yield token
+
+    # ===== EGGROLL (Evolution Strategies) Methods =====
+    # These methods are used ONLY during ES training, not during standard inference
+
+    @torch.inference_mode()
+    def evaluate_population(self, idx, targets, population_size, sigma, base_seed=0, step=0,
+                           world_size=1, ddp_rank=0, chunk_size=8):
+        """
+        Evaluate a population of perturbed models (TRAINING ONLY) with CHUNKED batching.
+        This method is ONLY used during ES training, not during inference/evaluation.
+        
+        CRITICAL: Processes population in CHUNKS to avoid OOM. Never materializes
+        full [population_size, batch_size, seq_len, vocab_size] tensor at once.
+        
+        IMPORTANT: Does NOT store perturbations in memory. Uses deterministic seeds
+        to regenerate noise on-the-fly during forward pass and again during ES update.
+        
+        DISTRIBUTED: Each rank evaluates only its subset of the population.
+        For example, with 8 GPUs and population_size=512:
+        - Rank 0: evaluates members 0-63 (64 members)
+        - Rank 1: evaluates members 64-127 (64 members)
+        - ... and so on
+        
+        Args:
+            idx: Input token indices [batch_size, seq_len]
+            targets: Target tokens [batch_size, seq_len]
+            population_size: TOTAL population size across all ranks (must be divisible by world_size)
+            sigma: Noise temperature (perturbation scale)
+            base_seed: Base random seed for reproducibility
+            step: Current training step (for seed coordination)
+            world_size: Number of distributed ranks (1 for single-GPU)
+            ddp_rank: Current rank ID (0 for single-GPU)
+            chunk_size: Process this many population members at once (default 8)
+                        CRITICAL: With large vocab (~50k), logits are [chunk, batch, seq, vocab]
+                        Memory usage: chunk * batch * seq * vocab * 4 bytes
+                        Example: 8 * 8 * 1024 * 50000 * 4 = ~13 GB just for logits!
+                        Start conservative (8-16), increase if memory allows
+        
+        Returns:
+            fitnesses: (population_per_rank,) tensor of LOCAL fitness scores
+            seeds: (population_per_rank,) tensor of LOCAL seeds used (for ES update)
+        
+        Note: rank=1 is hardcoded for optimization.
+        Perturbations are scaled by sigma: E = sigma * A @ B^T
+        """
+        from nanochat.egroll import compute_perturbation_seed
+        
+        device = idx.device
+        batch_size, seq_len = idx.shape
+        
+        # CRITICAL: Verify population divides evenly across ranks
+        assert population_size % world_size == 0, \
+            f"population_size ({population_size}) must be divisible by world_size ({world_size})"
+        
+        # Calculate local population size for this rank
+        population_per_rank = population_size // world_size
+        
+        # Generate seeds for LOCAL population members only
+        # Each rank generates different seeds based on its ddp_rank
+        seeds = torch.zeros(population_per_rank, dtype=torch.int64, device=device)
+        for i in range(population_per_rank):
+            seeds[i] = compute_perturbation_seed(
+                base_seed, step, world_size, population_size, ddp_rank, i
+            )
+        
+        # Allocate output fitnesses for LOCAL population only
+        fitnesses = torch.empty(population_per_rank, device=device)
+        
+        for chunk_start in range(0, population_per_rank, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, population_per_rank)
+            chunk_pop_size = chunk_end - chunk_start
+
+            # Get seeds for this chunk
+            seeds_chunk = seeds[chunk_start:chunk_end]
+
+            # Expand inputs to [chunk_size, batch_size, seq_len]
+            idx_chunk = idx.unsqueeze(0).expand(chunk_pop_size, -1, -1)
+            targets_chunk = targets.unsqueeze(0).expand(chunk_pop_size, -1, -1)
+
+            # Forward pass with batched perturbations for this chunk only
+            # Shape: [chunk_size, batch_size, seq_len, vocab_size]
+            logits_chunk = self._forward_batched_population(idx_chunk, seeds_chunk, sigma)
+
+            # Compute loss for each population member in chunk
+            # Reshape: [chunk * batch * seq, vocab] and [chunk * batch * seq]
+            logits_flat = logits_chunk.reshape(-1, logits_chunk.size(-1))
+            targets_flat = targets_chunk.reshape(-1)
+
+            # Compute CE loss
+            loss_flat = F.cross_entropy(logits_flat, targets_flat, reduction='none', ignore_index=-1)
+            # Reshape back: [chunk, batch, seq]
+            loss_per_token = loss_flat.reshape(chunk_pop_size, batch_size, seq_len)
+            # Average over batch and sequence: [chunk]
+            loss_per_member = loss_per_token.mean(dim=[1, 2])
+
+            # Fitness = negative loss
+            fitnesses[chunk_start:chunk_end] = -loss_per_member
+
+            # Chunk tensors will be freed here, keeping memory bounded
+        
+        return fitnesses, seeds
+
+    @torch.inference_mode()
+    def _forward_batched_population(self, idx, seeds, sigma):
+        """
+        Forward pass with batched low-rank perturbations (TRAINING ONLY, rank=1 optimized).
+        
+        All population members are processed in parallel using batched operations.
+        Perturbations are generated on-the-fly using deterministic seeds.
+        
+        Args:
+            idx: Input tokens [population_size, batch_size, seq_len]
+            seeds: Seeds for each population member [population_size]
+            sigma: Noise temperature (perturbation scale)
+        
+        Returns:
+            logits: [population_size, batch_size, seq_len, vocab_size]
+        
+        Note: rank=1 is hardcoded for optimization.
+        Perturbations are scaled by sigma: E = sigma * A @ B^T
+        """
+        pop_size, batch_size, seq_len = idx.shape
+        device = idx.device
+        
+        # Token Embedding with low-rank perturbations: [pop, batch, seq, n_embd]
+        # Treat embeddings as 2D matrix [vocab, n_embd] and use low-rank perturbations
+        # This is memory-efficient and matches the ES update for 2D parameters
+        
+        # Apply perturbed embedding: E_perturbed = E + (sigma/sqrt(r)) * A @ B^T
+        # Then index: x = E_perturbed[idx]
+        # Efficient computation: x = E[idx] + (sigma/sqrt(r)) * (A[idx] @ B^T)
+        
+        # Get base embeddings: x = E[idx] where E is the embedding weight matrix
+        base_emb = self.transformer.wte(idx)  # [pop, batch, seq, n_embd]
+        
+        from nanochat.egroll import stable_hash_name
+        
+        # Apply low-rank perturbations to embedding matrix: E_perturbed = E + sigma * A @ B^T
+        # Conceptually: x = E_perturbed[idx] = E[idx] + (sigma * A @ B^T)[idx]
+        # Efficiently: x = E[idx] + sigma * (A[idx] @ B^T) without materializing full [pop, vocab, n_embd]
+        # This is mathematically equivalent to perturbing the weight matrix then indexing
+        
+        from nanochat.egroll import stable_hash_name, get_parameter_name
+        weight_name = get_parameter_name(self.transformer.wte.weight, self)
+        layer_hash = stable_hash_name(weight_name)
+        vocab_size, n_embd = self.transformer.wte.weight.shape
+        # rank=1: sqrt(1)=1.0, so no sqrt scaling needed
+        # Perturbations are scaled by sigma: E = sigma * A @ B^T
+        
+        x = base_emb.clone()
+        
+        # Generate noise for each population member independently
+        # CRITICAL: Each member must have independent noise based on their own seed
+        # Using seeds[0] for all members would create correlated noise, breaking ES
+        A_chunk = torch.zeros(pop_size, vocab_size, device=device, dtype=base_emb.dtype)
+        B_chunk = torch.zeros(pop_size, n_embd, device=device, dtype=base_emb.dtype)
+        
+        # Generate noise for each member using their individual seed
+        for i in range(pop_size):
+            member_seed = int(seeds[i].item()) + layer_hash
+            gen = torch.Generator(device=device)
+            gen.manual_seed(member_seed)
+            A_chunk[i] = torch.randn(vocab_size, generator=gen, device=device, dtype=base_emb.dtype)
+            B_chunk[i] = torch.randn(n_embd, generator=gen, device=device, dtype=base_emb.dtype)
+        
+        # For each member, compute perturbation for tokens used in sequence
+        # Mathematically: x[c] = E[idx[c]] + (sigma * A[c] @ B[c]^T)[idx[c]]
+        # Efficiently: x[c] = E[idx[c]] + sigma * A[c][idx[c]] @ B[c]^T
+        for c in range(pop_size):
+            # Index A by tokens to get noise values for tokens in this sequence
+            A_indexed = A_chunk[c][idx[c]]  # [batch, seq]
+            # Compute perturbation: sigma * (A_indexed @ B^T) = sigma * [batch, seq] @ [n_embd] = [batch, seq, n_embd]
+            # Using outer product: A_indexed.unsqueeze(-1) * B_chunk[c] broadcasts correctly
+            emb_pert = sigma * (A_indexed.unsqueeze(-1) * B_chunk[c])
+            x[c] += emb_pert
+        
+        # Initial norm
+        x = norm(x)  # Applies independently per population member
+        
+        # Rotary embeddings for this sequence length
+        T = seq_len
+        assert T <= self.cos.size(1), f"Sequence length grew beyond rotary cache: {T} > {self.cos.size(1)}"
+        cos_sin = self.cos[:, :T], self.sin[:, :T]  # Broadcasts over population dimension
+        
+        # Transformer blocks with batched perturbations
+        for block_idx, block in enumerate(self.transformer.h):
+            x = self._forward_block_batched(x, block, block_idx, seeds, sigma, cos_sin)
+        
+        # Final norm
+        x = norm(x)
+        
+        # Output projection (LM head) with perturbations
+        logits = self._linear_batched_lowrank(
+            x, self.lm_head.weight,
+            seeds=seeds, sigma=sigma
+        )
+        
+        # Apply softcap (same as standard forward)
+        softcap = 15
+        logits = softcap * torch.tanh(logits / softcap)
+        
+        return logits
+
+    def _forward_block_batched(self, x, block, block_idx, seeds, sigma, cos_sin):
+        """
+        Forward through one transformer block with batched perturbations (rank=1 optimized).
+        
+        Args:
+            x: [pop, batch, seq, n_embd]
+            block: Block module
+            block_idx: Index of this block (for seed coordination)
+            seeds: [pop] seeds for noise generation
+            sigma: Noise temperature (perturbation scale)
+            cos_sin: Tuple of (cos, sin) rotary embeddings
+        
+        Returns:
+            x: [pop, batch, seq, n_embd]
+        
+        Note: rank=1 is hardcoded for optimization.
+        Perturbations are scaled by sigma: E = sigma * A @ B^T
+        """
+        pop_size, batch_size, seq_len, n_embd = x.shape
+        device = x.device
+        
+        # === Self-Attention with Perturbations ===
+        
+        # Norm (applies independently per population member)
+        x_norm = norm(x)  # [pop, batch, seq, n_embd]
+        
+        # Q, K, V projections with perturbations
+        n_head = block.attn.n_head
+        n_kv_head = block.attn.n_kv_head
+        head_dim = block.attn.head_dim
+        
+        # Query projection with perturbations
+        q = self._linear_batched_lowrank(
+            x_norm,
+            block.attn.c_q.weight,
+            seeds=seeds,
+            sigma=sigma
+        )  # [pop, batch, seq, n_head * head_dim]
+        
+        # Key projection with perturbations
+        k = self._linear_batched_lowrank(
+            x_norm,
+            block.attn.c_k.weight,
+            seeds=seeds,
+            sigma=sigma
+        )  # [pop, batch, seq, n_kv_head * head_dim]
+        
+        # Value projection with perturbations
+        v = self._linear_batched_lowrank(
+            x_norm,
+            block.attn.c_v.weight,
+            seeds=seeds,
+            sigma=sigma
+        )  # [pop, batch, seq, n_kv_head * head_dim]
+        
+        # Reshape for multi-head attention
+        q = q.view(pop_size, batch_size, seq_len, n_head, head_dim)
+        k = k.view(pop_size, batch_size, seq_len, n_kv_head, head_dim)
+        v = v.view(pop_size, batch_size, seq_len, n_kv_head, head_dim)
+        
+        # Apply rotary embeddings (broadcasts over population dimension)
+        cos, sin = cos_sin
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
+        
+        # QK norm (applies independently per population member)
+        q = norm(q)
+        k = norm(k)
+        
+        # Transpose for attention: [pop, batch, n_head, seq, head_dim]
+        q = q.transpose(2, 3)
+        k = k.transpose(2, 3)
+        v = v.transpose(2, 3)
+        
+        # Compute attention scores: Q @ K^T
+        # For GQA, we need to handle the case where n_head != n_kv_head
+        # We'll use manual attention computation to handle batched population
+        
+        # Expand k, v to match query heads if needed (GQA)
+        if n_head != n_kv_head:
+            repeats = n_head // n_kv_head
+            k = k.repeat_interleave(repeats, dim=2)
+            v = v.repeat_interleave(repeats, dim=2)
+        
+        # Attention: [pop, batch, n_head, seq_q, seq_k]
+        att = torch.matmul(q, k.transpose(-2, -1))
+        att = att / math.sqrt(head_dim)
+        
+        # Apply causal mask (broadcasts over population dimension)
+        # Mask shape: [1, 1, 1, seq, seq] -> broadcasts to [pop, batch, n_head, seq, seq]
+        causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool))
+        causal_mask = causal_mask.view(1, 1, 1, seq_len, seq_len)
+        att = att.masked_fill(~causal_mask, float('-inf'))
+        
+        # Softmax (applies per population member independently)
+        att = F.softmax(att, dim=-1)
+        
+        # Attention output: attention weights @ V
+        y = torch.matmul(att, v)  # [pop, batch, n_head, seq, head_dim]
+        
+        # Transpose back: [pop, batch, seq, n_head, head_dim]
+        y = y.transpose(2, 3)
+        
+        # Reshape: [pop, batch, seq, n_embd]
+        y = y.contiguous().view(pop_size, batch_size, seq_len, n_embd)
+        
+        # Output projection with perturbations
+        y = self._linear_batched_lowrank(
+            y,
+            block.attn.c_proj.weight,
+            seeds=seeds,
+            sigma=sigma
+        )  # [pop, batch, seq, n_embd]
+        
+        # Residual connection
+        x = x + y
+        
+        # === MLP with Perturbations ===
+        
+        # Norm
+        x_norm = norm(x)  # [pop, batch, seq, n_embd]
+        
+        # First MLP layer (expand) with perturbations
+        h = self._linear_batched_lowrank(
+            x_norm,
+            block.mlp.c_fc.weight,
+            seeds=seeds,
+            sigma=sigma
+        )  # [pop, batch, seq, 4*n_embd]
+        
+        # Activation (ReLU^2)
+        h = F.relu(h).square()
+        
+        # Second MLP layer (project back) with perturbations
+        h = self._linear_batched_lowrank(
+            h,
+            block.mlp.c_proj.weight,
+            seeds=seeds,
+            sigma=sigma
+        )  # [pop, batch, seq, n_embd]
+        
+        # Residual connection
+        x = x + h
+        
+        return x  # [pop, batch, seq, n_embd]
+
+    def _linear_batched_lowrank(self, x, weight_param, seeds, sigma):
+        """
+        Batched linear transformation with low-rank perturbations (rank=1 optimized).
+        
+        Applies: y = x @ (W + E)^T
+        where E = sigma * A @ B^T (rank=1: no sqrt scaling needed)
+        
+        Efficient implementation for rank=1:
+        y = x @ W^T + sigma * (x @ B) * A
+        where A is [chunk, out_features] and B is [chunk, in_features] (vectors)
+        
+        CRITICAL: Uses stable hash for layer offsets (not Python hash())
+        and per-call Generator for noise (not global RNG state).
+        
+        Args:
+            x: Input [pop, ..., in_features]
+            weight_param: Base weight [out_features, in_features] (parameter object)
+            seeds: [pop] base seeds for each population member
+            sigma: Noise temperature (perturbation scale)
+        
+        Returns:
+            y: Output [pop, ..., out_features]
+        
+        Note: rank=1 is hardcoded for optimization.
+        Perturbations are scaled by sigma: E = sigma * A @ B^T
+        """
+        from nanochat.egroll import stable_hash_name, get_parameter_name
+        
+        # CRITICAL: Get parameter name BEFORE converting to dtype
+        # weight_param.to() returns a new tensor, losing the Parameter reference
+        weight_name = get_parameter_name(weight_param, self)
+        layer_hash = stable_hash_name(weight_name)
+        
+        pop_size = x.shape[0]
+        out_features, in_features = weight_param.shape
+        device = x.device
+        
+        # Base transformation: x @ W^T
+        # x: [pop, batch, seq, in_features]
+        # W: [out_features, in_features]
+        # Need to broadcast W across population dimension
+        # Use a dtype-cast copy for the actual matmul
+        weight = weight_param.to(x.dtype)
+        y_base = torch.matmul(x, weight.t())  # [pop, batch, seq, out_features]
+        
+        # rank=1: sqrt(1)=1.0, so no sqrt scaling needed
+        # Perturbations are scaled by sigma: E = sigma * A @ B^T
+        
+        # Generate noise for each population member independently
+        # CRITICAL: Each member must have independent noise based on their own seed
+        # Using seeds[0] for all members would create correlated noise, breaking ES
+        A_chunk = torch.zeros(pop_size, out_features, device=device, dtype=x.dtype)
+        B_chunk = torch.zeros(pop_size, in_features, device=device, dtype=x.dtype)
+        
+        # Generate noise for each member using their individual seed
+        for i in range(pop_size):
+            member_seed = int(seeds[i].item()) + layer_hash
+            gen = torch.Generator(device=device)
+            gen.manual_seed(member_seed)
+            A_chunk[i] = torch.randn(out_features, generator=gen, device=device, dtype=x.dtype)
+            B_chunk[i] = torch.randn(in_features, generator=gen, device=device, dtype=x.dtype)
+        
+        # Apply perturbation for rank=1: sigma * (x @ B) * A^T
+        # Paper: xi(µ + σEi) = xiµ + σ * (xiBi) * A^T_i
+        # For rank=1: xiBi is batched vector-vector dot product (scalars)
+        # Then batched scalar-vector multiplication with A^T_i
+        
+        # Reshape for batched matmul: [pop, batch*seq, in_features]
+        orig_shape = x.shape
+        x_flat = x.reshape(pop_size, -1, in_features)
+        
+        # xiBi: batched vector-vector dot product to get scalars (inexpensive per paper)
+        # x_flat: [pop, batch*seq, in_features]
+        # B_chunk: [pop, in_features]
+        # Use bmm for efficient batched matrix-vector multiplication
+        # Result: [pop, batch*seq] (scalars per position)
+        xB = torch.bmm(x_flat, B_chunk.unsqueeze(-1)).squeeze(-1)
+        
+        # (xiBi) * A^T_i: batched scalar-vector multiplication
+        # xB: [pop, batch*seq] (scalars)
+        # A_chunk: [pop, out_features] (A^T_i when viewed as row vector)
+        # Result: [pop, batch*seq, out_features]
+        # Broadcast: [pop, batch*seq, 1] * [pop, 1, out_features]
+        xBA = sigma * (xB.unsqueeze(-1) * A_chunk.unsqueeze(1))
+        
+        # Reshape back
+        y_pert = xBA.reshape(orig_shape[:-1] + (out_features,))
+        
+        y = y_base + y_pert
+        
+        return y
